@@ -15,7 +15,7 @@ from mprl.budget import (
     save_measurements,
 )
 from mprl.config import SweepSpec
-from mprl.errors import BudgetExceeded
+from mprl.errors import BudgetExceeded, MeasurementsCorrupt, MprlOperatingError
 
 COUNTS = (64, 256, 1024, 4096, 16384)
 
@@ -96,6 +96,31 @@ def test_measurements_round_trip_with_int_keys(tmp_path: Path) -> None:
 
     assert load_measurements(path) == m
     assert all(isinstance(n, int) for n in load_measurements(path).fits)
+
+
+_VALID = '"eval_seconds_per_checkpoint": 2.5, "io_overhead_fraction": 0.04'
+CORRUPT_MEASUREMENTS = {
+    "not_json": "{not json",
+    "not_an_object": "[1, 2]",
+    "missing_key": '{"eval_seconds_per_checkpoint": 2.5}',
+    "fits_not_a_mapping": "{" + _VALID + ', "fits": [64], "steps_per_second": {}}',
+    "non_numeric_rate": "{" + _VALID + ', "fits": {"64": true}, "steps_per_second": {"64": "fast"}}',
+    "rate_for_unfit_count": "{" + _VALID + ', "fits": {"64": false}, "steps_per_second": {"64": 900.0}}',
+    "negative_eval_time": '{"eval_seconds_per_checkpoint": -1, "io_overhead_fraction": 0, '
+    '"fits": {}, "steps_per_second": {}}',
+}
+
+
+@pytest.mark.parametrize("text", list(CORRUPT_MEASUREMENTS.values()), ids=list(CORRUPT_MEASUREMENTS))
+def test_corrupt_measurements_file_is_an_operating_error_naming_the_path(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "measurements.json"
+    path.write_text(text)
+
+    with pytest.raises(MeasurementsCorrupt, match=rf"^{path} is corrupt \(") as caught:
+        load_measurements(path)
+
+    assert isinstance(caught.value, MprlOperatingError)
+    assert "mprl throughput" in str(caught.value)
 
 
 def test_estimate_exactly_at_the_cap_needs_no_cut() -> None:

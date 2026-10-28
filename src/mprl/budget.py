@@ -22,8 +22,8 @@ import math
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Final
 
-from mprl.errors import BudgetExceeded
-from mprl.negative_space import check_finite, require
+from mprl.errors import BudgetExceeded, MeasurementsCorrupt
+from mprl.negative_space import CheckFailed, check_finite, require
 from mprl.run_state import write_json_atomic
 
 if TYPE_CHECKING:
@@ -76,14 +76,27 @@ def save_measurements(path: Path, m: Measurements) -> None:
 
 
 def load_measurements(path: Path) -> Measurements:
-    data = json.loads(path.read_text())
-    require(isinstance(data, dict), f"{path} does not hold a JSON object")
-    return Measurements(
-        eval_seconds_per_checkpoint=float(data["eval_seconds_per_checkpoint"]),
-        io_overhead_fraction=float(data["io_overhead_fraction"]),
-        fits={int(n): bool(ok) for n, ok in data["fits"].items()},
-        steps_per_second={int(n): float(sps) for n, sps in data["steps_per_second"].items()},
-    )
+    """The measurements in ``path`` (which must exist); ``MeasurementsCorrupt`` naming the path otherwise.
+
+    The file is outside input (a crash mid-write on an older version, a hand edit), so an unreadable or
+    out-of-range value is an operating error, not a crash: every parse failure, and a value
+    ``Measurements.__post_init__`` rejects, becomes one.
+    """
+    text = path.read_text()
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise TypeError(f"top level is {type(data).__name__}, not a JSON object")
+        return Measurements(
+            eval_seconds_per_checkpoint=float(data["eval_seconds_per_checkpoint"]),
+            io_overhead_fraction=float(data["io_overhead_fraction"]),
+            fits={int(n): bool(ok) for n, ok in data["fits"].items()},
+            steps_per_second={int(n): float(sps) for n, sps in data["steps_per_second"].items()},
+        )
+    except (ValueError, KeyError, TypeError, AttributeError, CheckFailed) as error:  # JSONDecodeError is a ValueError
+        raise MeasurementsCorrupt(
+            f"{path} is corrupt ({type(error).__name__}: {error}); re-run `mprl throughput` to rewrite it"
+        ) from error
 
 
 def estimate(

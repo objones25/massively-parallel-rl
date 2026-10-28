@@ -7,7 +7,6 @@ the terminator is an autospecced ``PodTerminator``. ``main`` runs in-process wit
 from __future__ import annotations
 
 import importlib.metadata
-import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
@@ -86,18 +85,17 @@ def test_sweep_budget_exceeded_attended_still_terminates(
 
 
 def test_sweep_corrupt_measurements_terminates(
-    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root.mkdir(parents=True)
     (root / "measurements.json").write_text("{not json")
     sweep = _sweep_double(monkeypatch)
 
-    with pytest.raises(json.JSONDecodeError, match=r"^Expecting ") as caught:
-        _main("sweep", "--name", "main")
+    assert _main("sweep", "--name", "main") == 1
 
-    assert (caught.value.doc, caught.value.pos) == ("{not json", 1)
     sweep.assert_not_called()
     terminator.terminate.assert_called_once_with()
+    assert f"mprl: MeasurementsCorrupt: {root / 'measurements.json'} is corrupt (" in capsys.readouterr().err
 
 
 TRAINING_ARGV = {

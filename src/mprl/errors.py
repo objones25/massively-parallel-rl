@@ -39,6 +39,10 @@ class MeasurementMissing(MprlOperatingError):
     """A sweep env count has no throughput measurement, so whether it fits is unknown."""
 
 
+class MeasurementsCorrupt(MprlOperatingError):
+    """``measurements.json`` exists but cannot be read as throughput measurements."""
+
+
 class PreflightFailed(MprlOperatingError):
     """A setup check found the pod, a service or the volume not ready."""
 
