@@ -43,7 +43,6 @@ Off the clock: the one-time setup before the loop (random episode lengths, ``get
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -53,6 +52,7 @@ from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.velocity.rl.runner import VelocityOnPolicyRunner
 from rsl_rl.utils import check_nan
 
+from mprl.clock import next_checkpoint_due
 from mprl.negative_space import check_finite, expect, require
 
 if TYPE_CHECKING:
@@ -64,19 +64,6 @@ if TYPE_CHECKING:
     from mprl.clock import TrainingClock
 
 _MAX_ITERATIONS = 10_000_000  # CheckpointStore names hold 7 iteration digits
-
-
-def next_checkpoint_due(elapsed_s: float, every_s: float, last_saved_s: float) -> bool:
-    """True once ``elapsed_s`` has reached the first multiple of ``every_s`` above ``last_saved_s``."""
-    check_finite(elapsed_s, "elapsed_s")
-    check_finite(every_s, "every_s")
-    check_finite(last_saved_s, "last_saved_s")
-    require(every_s > 0.0, f"every_s must be positive, got {every_s}")
-    require(elapsed_s >= 0.0, f"elapsed_s must be non-negative, got {elapsed_s}")
-    require(last_saved_s >= 0.0, f"last_saved_s must be non-negative, got {last_saved_s}")
-    require(last_saved_s <= elapsed_s, f"last_saved_s {last_saved_s} is after elapsed_s {elapsed_s}")
-    next_mark = (math.floor(last_saved_s / every_s) + 1) * every_s
-    return elapsed_s >= next_mark
 
 
 @dataclass(frozen=True)

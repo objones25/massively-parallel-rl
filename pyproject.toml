@@ -98,7 +98,7 @@ filterwarnings = [
 # Backstop beyond every pytest-timeout: dump all stacks and exit if a test still runs (a hang in C code).
 faulthandler_timeout = 900
 faulthandler_exit_on_timeout = true
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]  # tests/support.py: helpers shared by the smoke tests
 
 [tool.coverage.run]
 branch = true

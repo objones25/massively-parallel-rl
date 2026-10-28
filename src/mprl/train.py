@@ -23,18 +23,11 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
-
-import mjlab.tasks  # noqa: F401  # pyright: ignore[reportUnusedImport]  (registers the tasks)
-from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
-from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
-from mjlab.utils.os import dump_yaml
-from mjlab.utils.torch import configure_torch_backends
 
 from mprl import diagnostics
 from mprl.checkpoints import CheckpointRef, CheckpointStore
@@ -45,11 +38,14 @@ from mprl.negative_space import expect, require
 from mprl.paths import RunPaths
 from mprl.publish import export_onnx, hub_path, upload_run
 from mprl.run_state import RunState, load_state, save_state
-from mprl.timed_runner import TimedOnPolicyRunner
+from mprl.tasks import load_task_env_cfg, load_task_rl_cfg
 from mprl.wandb_writer import logger_cfg
 
 if TYPE_CHECKING:
+    from mjlab.envs import ManagerBasedRlEnvCfg
+
     from mprl.hub import HubPublisher
+    from mprl.timed_runner import TimedOnPolicyRunner
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +123,40 @@ def git_sha(repo: Path = _REPO_DIR) -> str:
     return sha
 
 
+def _mint_suffix() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def wandb_run_id_for(
+    state: RunState | None, latest: CheckpointRef | None, run_id: str, *, mint: Callable[[], str] = _mint_suffix
+) -> str:
+    """The stored W&B id when the run resumes (a ``state.json`` and a checkpoint), else a new one.
+
+    Without a checkpoint the run trains from iteration 0, so continuing a crashed run's W&B id would mix
+    its history with steps that restart at 0.
+    """
+    require(bool(run_id), "run_id must be non-empty")
+    if state is not None and latest is not None:
+        return state.wandb_run_id
+    suffix = mint()
+    require(bool(suffix), "minted W&B id suffix is empty")
+    return f"{run_id}-{suffix}"
+
+
+def failed_after_final_checkpoint(
+    saved: Sequence[CheckpointRef], elapsed_s: float, budget_s: float, current_iteration: int
+) -> bool:
+    """Whether an error inside ``learn_for`` came after its final checkpoint (writer stop, ONNX export).
+
+    Such an error must not discard a finished run, so it is recorded; any other is a training failure.
+    The final checkpoint exists once the clock reached the budget and the last save is the iteration the
+    runner is at.
+    """
+    require(budget_s > 0.0, f"budget_s must be positive, got {budget_s}")
+    require(elapsed_s >= 0.0, f"elapsed_s must be non-negative, got {elapsed_s}")
+    return bool(saved) and elapsed_s >= budget_s and saved[-1].iteration == current_iteration
+
+
 def wandb_logger_cfg(
     spec: RunSpec,
     wandb_run_id: str,
@@ -137,8 +167,7 @@ def wandb_logger_cfg(
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
     """``agent_cfg["logger"]``: the resumable writer plus run config (spec, batch arithmetic, SHA, digest)."""
-    loaded = load_rl_cfg(spec.task_id)
-    rl_cfg = expect(loaded if isinstance(loaded, RslRlOnPolicyRunnerCfg) else None, f"{spec.task_id} is not a PPO task")
+    rl_cfg = load_task_rl_cfg(spec.task_id)
     batch = batch_arithmetic(spec.num_envs, rl_cfg.num_steps_per_env, rl_cfg.algorithm.num_mini_batches)
     extra: dict[str, Any] = {
         "run": asdict(spec),
@@ -163,10 +192,10 @@ def resolve_cfgs(spec: RunSpec, logger: dict[str, Any] | str) -> tuple[ManagerBa
     Seeds as ``mjlab/scripts/train.py`` does on one device: ``agent.seed = env.seed = seed``; the env's
     ``seed_rng`` then seeds random, numpy, warp and torch.
     """
-    env_cfg = load_env_cfg(spec.task_id)
+    env_cfg = load_task_env_cfg(spec.task_id)
     env_cfg.scene.num_envs = spec.num_envs
     env_cfg.seed = spec.seed
-    rl_cfg = load_rl_cfg(spec.task_id)
+    rl_cfg = load_task_rl_cfg(spec.task_id)
     rl_cfg.seed = spec.seed
     agent_cfg = asdict(rl_cfg)
     agent_cfg["logger"] = logger
@@ -191,6 +220,13 @@ def built_runner(
     the training one (the evaluator's play env); the agent config, and so the policy, is unchanged.
     ``render_mode`` is passed to the env (``"rgb_array"`` for ``env.render()``).
     """
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.rl import RslRlVecEnvWrapper
+    from mjlab.utils.os import dump_yaml
+    from mjlab.utils.torch import configure_torch_backends
+
+    from mprl.timed_runner import TimedOnPolicyRunner
+
     training_env_cfg, agent_cfg = resolve_cfgs(spec, logger)
     env_cfg = training_env_cfg if env_cfg is None else env_cfg
     configure_torch_backends()  # as mjlab's train script
@@ -228,7 +264,7 @@ def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:
 
     latest = CheckpointStore(paths.checkpoints_dir).latest()
     resuming = latest is not None and state is not None
-    wandb_run_id = state.wandb_run_id if resuming and state else f"{spec.run_id}-{uuid.uuid4().hex[:8]}"
+    wandb_run_id = wandb_run_id_for(state, latest, spec.run_id)
     sha = git_sha()
     state = RunState(
         spec.run_id,
@@ -311,8 +347,7 @@ def _learn(
     except Exception as error:
         # After the final checkpoint learn_for only stops the writer and exports ONNX. A failure there
         # must not discard a finished run: record it. Anything earlier is a training failure.
-        final_saved = bool(saved) and clock.elapsed_s >= budget_s
-        if not final_saved or saved[-1].iteration != runner.current_learning_iteration:
+        if not failed_after_final_checkpoint(saved, clock.elapsed_s, budget_s, runner.current_learning_iteration):
             raise
         log.warning("%s: post-training step failed after the final checkpoint: %s", spec.run_id, error)
         # The writer stop runs before the export, so its failure skipped the ONNX: export it here.

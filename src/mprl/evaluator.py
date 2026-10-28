@@ -54,18 +54,17 @@ from dataclasses import astuple, dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import mjlab.tasks  # noqa: F401  # pyright: ignore[reportUnusedImport]  (registers the tasks)
 import torch
-from mjlab.tasks.registry import load_env_cfg
-from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommand, UniformVelocityCommandCfg
 
 from mprl.config import TASK_ID, RunSpec
 from mprl.negative_space import check_finite, check_shape, expect, require
+from mprl.tasks import load_task_env_cfg
 from mprl.train import built_runner
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
     from mjlab.rl import RslRlVecEnvWrapper
+    from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommand
     from tensordict import TensorDict
 
     from mprl.checkpoints import CheckpointRef
@@ -143,7 +142,9 @@ def command_tensor(cfg: EvalConfig, device: str | torch.device) -> torch.Tensor:
 
 def eval_env_cfg(cfg: EvalConfig) -> ManagerBasedRlEnvCfg:
     """The play env config with ``cfg.num_envs`` envs, seeded with ``seeds[0]``, every command override off."""
-    env_cfg = load_env_cfg(TASK_ID, play=True)
+    from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommandCfg  # lazy: see mprl.tasks
+
+    env_cfg = load_task_env_cfg(TASK_ID, play=True)
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.seed = cfg.seeds[0]
     require(cfg.horizon_s < env_cfg.episode_length_s, "the horizon must end before the play episode times out")
@@ -199,6 +200,8 @@ def loaded_policy(
 
 
 def twist_term(env: ManagerBasedRlEnv) -> UniformVelocityCommand:
+    from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommand  # lazy: see mprl.tasks
+
     term = env.command_manager.get_term(_TWIST)
     require(isinstance(term, UniformVelocityCommand), f"{_TWIST} is not a UniformVelocityCommand")
     return term  # pyright: ignore[reportReturnType]  narrowed by the require above

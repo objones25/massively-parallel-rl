@@ -16,18 +16,20 @@ import importlib.util
 import ipaddress
 import os
 import random
+import signal
 import socket
+import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from typing import IO, Any
 
 import pytest
+from support import APP_ENV_PREFIXES, DEFAULT_MARKEXPR
 
 # One fixed seed for the whole suite. Any value works; it must never change.
 SEED = 20260826
 
-# Environment variable prefixes owned by the project under test.
-APP_ENV_PREFIXES = ("MPRL_", "WANDB_", "HF_", "RUNPOD_")
 
 MARKERS = (
     "smoke: real mjlab / rsl_rl / wandb offline / ffmpeg / subprocesses on CPU; deselected by default (pytest -m smoke)",
@@ -166,6 +168,93 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------
+# Subprocesses
+# --------------------------------------------------------------------------
+KILL_WAIT_S = 10.0  # after SIGKILL to the group, the reap itself is bounded too
+
+
+class Subprocesses:
+    """The only way tests start a process: its own session, no stdin, bounded waits, group killed after.
+
+    ``start_new_session=True`` makes the child the leader of a new process group, so ``os.killpg`` reaches
+    everything it started (uv's python, ffmpeg); ``stdin=DEVNULL`` means nothing can block reading the
+    terminal. Every process still alive at teardown has its group SIGKILLed and is reaped.
+    """
+
+    def __init__(self) -> None:
+        self._started: list[subprocess.Popen[Any]] = []
+
+    def spawn(self, argv: Sequence[str], *, env: dict[str, str], stdout: IO[Any] | int) -> subprocess.Popen[Any]:
+        child = subprocess.Popen(  # noqa: S603  argv is built by the test, never from input
+            list(argv), env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )  # fmt: skip
+        self._started.append(child)
+        return child
+
+    def run(self, argv: Sequence[str], *, env: dict[str, str], timeout_s: float) -> subprocess.CompletedProcess[str]:
+        child = subprocess.Popen(  # noqa: S603  argv is built by the test, never from input
+            list(argv), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )  # fmt: skip
+        self._started.append(child)
+        try:
+            out, err = child.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            self.kill_group(child)
+            raise
+        return subprocess.CompletedProcess(list(argv), child.returncode, out, err)
+
+    @staticmethod
+    def kill_group(child: subprocess.Popen[Any]) -> None:
+        """SIGKILL the child's whole process group, then reap the child (bounded)."""
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:  # the group is already gone
+            pass
+        child.communicate(timeout=KILL_WAIT_S)
+
+    def close(self) -> None:
+        for child in self._started:
+            if child.poll() is None:
+                self.kill_group(child)
+
+
+@pytest.fixture
+def subprocesses() -> Iterator[Subprocesses]:
+    procs = Subprocesses()
+    try:
+        yield procs
+    finally:
+        procs.close()
+
+
+# --------------------------------------------------------------------------
+# Shared doubles
+# --------------------------------------------------------------------------
+@pytest.fixture
+def hub_http_error() -> Callable[[int], Exception]:
+    """``status -> HfHubHTTPError`` built the way huggingface_hub builds one from a server reply.
+
+    A live 5xx or 429 cannot be provoked on demand; ``hf_raise_for_status`` on a real ``httpx2.Response``
+    yields the same class and ``.response.status_code`` a server reply would (see tests/unit/test_hub_retry.py).
+    """
+    import httpx2
+    from huggingface_hub.errors import HfHubHTTPError
+    from huggingface_hub.utils import hf_raise_for_status
+
+    def build(status: int) -> Exception:
+        request = httpx2.Request("POST", "https://huggingface.co/api/models/someone/mprl-test/commit/main")
+        try:
+            hf_raise_for_status(httpx2.Response(status, request=request))
+        except HfHubHTTPError as error:
+            return error
+        raise AssertionError(f"status {status} did not raise")
+
+    return build
+
+
+# --------------------------------------------------------------------------
 # Hypothesis profiles
 # --------------------------------------------------------------------------
 if importlib.util.find_spec("hypothesis") is not None:
@@ -184,6 +273,17 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register markers in code too, so this conftest works before pyproject is updated."""
     for line in MARKERS:
         config.addinivalue_line("markers", line)
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """Under the default -m (fast tier only), do not even import the heavy tiers' modules.
+
+    Their tests would all be deselected anyway; importing them costs the ~2.7 s mjlab import and, on
+    Linux, needs mjlab's EGL/GL system libraries. Any other -m (``-m smoke``) collects them as usual.
+    """
+    if config.getoption("markexpr") == DEFAULT_MARKEXPR and collection_path.name in DIRECTORY_MARKERS:
+        return True
+    return None
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

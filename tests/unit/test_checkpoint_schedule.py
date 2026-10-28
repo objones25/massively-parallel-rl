@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from mprl.clock import next_checkpoint_due
 from mprl.negative_space import CheckFailed
-from mprl.timed_runner import next_checkpoint_due
 
 
 @pytest.mark.parametrize(

@@ -33,8 +33,6 @@ from typing import Any, Final
 import numpy as np
 import wandb
 from huggingface_hub.errors import HfHubHTTPError
-from mjlab.rl import RslRlOnPolicyRunnerCfg
-from mjlab.tasks.registry import load_rl_cfg
 from wandb.errors import Error as WandbError
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
@@ -43,12 +41,13 @@ from mprl.curves import aggregate, median_seed_run, plot_learning_curves, valida
 from mprl.errors import UploadFailed
 from mprl.evaluator import EVAL_COMMANDS, EvalConfig, EvalResult, evaluate_checkpoint, read_eval_csv, write_eval_csv
 from mprl.hub import HubPublisher
-from mprl.negative_space import bounded, expect, require
+from mprl.negative_space import bounded, require
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.race_video import race_frames, race_timeline, write_video
 from mprl.render import render_rollout
 from mprl.results_card import model_card
 from mprl.sweep import pilot_spec
+from mprl.tasks import load_task_rl_cfg
 from mprl.train import DEFAULT_WANDB_PROJECT
 
 log = logging.getLogger(__name__)
@@ -243,8 +242,7 @@ def _render_race(
 
 def _check_shipped_batch_config() -> None:
     """The chart caption and model card use ``batch_arithmetic``'s defaults; they must be the shipped config."""
-    loaded = load_rl_cfg(TASK_ID)
-    rl = expect(loaded if isinstance(loaded, RslRlOnPolicyRunnerCfg) else None, f"{TASK_ID} is not a PPO task")
+    rl = load_task_rl_cfg(TASK_ID)
     shipped = batch_arithmetic(1, rl.num_steps_per_env, rl.algorithm.num_mini_batches)
     require(shipped == batch_arithmetic(1), f"shipped batch config {shipped} differs from the defaults")
 

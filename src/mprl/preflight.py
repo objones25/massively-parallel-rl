@@ -25,13 +25,10 @@ from typing import Final
 
 import httpx
 import httpx2
-import mjlab.tasks  # noqa: F401  # pyright: ignore[reportUnusedImport]  (registers the tasks)
 import torch
 import wandb
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
-from mjlab.envs import ManagerBasedRlEnv
-from mjlab.tasks.registry import load_env_cfg
 from wandb.errors import Error as WandbError
 from wandb.sdk.lib.service.service_connection import WandbApiFailedError
 
@@ -41,6 +38,7 @@ from mprl.hub import HubPublisher
 from mprl.negative_space import bounded, check_finite
 from mprl.paths import volume_root
 from mprl.runpod import own_terminator
+from mprl.tasks import load_task_env_cfg
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +94,9 @@ def check_cuda(device: str) -> str:
 
 def check_env(device: str) -> str:
     """The G1 task with 2 envs builds on ``device`` (MuJoCo Warp) and steps with zero actions."""
-    cfg = load_env_cfg(TASK_ID)
+    from mjlab.envs import ManagerBasedRlEnv  # lazy: see mprl.tasks
+
+    cfg = load_task_env_cfg(TASK_ID)
     cfg.scene.num_envs = _ENV_CHECK_NUM_ENVS
     env = ManagerBasedRlEnv(cfg=cfg, device=device)
     try:
