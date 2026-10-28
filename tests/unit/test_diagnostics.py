@@ -158,3 +158,25 @@ def test_metrics_are_finite(models: tuple[nn.Sequential, nn.Sequential]) -> None
     assert len(metrics) > 20
     for key, value in metrics.items():
         check_finite(value, key)
+
+
+def test_non_finite_metric_is_dropped_with_a_warning_not_raised(
+    models: tuple[nn.Sequential, nn.Sequential], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A diverging run (an inf weight) must not stop training over a diagnostic."""
+    actor, critic = models
+    diag = TrainingDiagnostics(actor, critic, every_k=1)
+    diag.attach()
+    diag.before_update(0)
+    _backward(actor, critic, torch.randn(5, 3))
+    with torch.no_grad():
+        actor[0].weight[0, 0] = float("inf")
+
+    metrics = diag.after_update(0)
+
+    assert "Diag/weight_norm/actor/0.weight" not in metrics
+    assert "Diag/update_ratio/actor/0.weight" not in metrics
+    assert metrics["Diag/weight_norm/critic/0.weight"] == pytest.approx(
+        float(torch.linalg.vector_norm(critic[0].weight.detach()))
+    )
+    assert "Diag/weight_norm/actor/0.weight=inf" in caplog.text

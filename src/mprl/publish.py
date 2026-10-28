@@ -163,24 +163,43 @@ class SigtermHandler:
 
     Python runs it in the main thread between bytecodes, so the exception surfaces wherever the main thread
     is (env step, PPO update, an upload) and unwinds through ``train_run`` (``state.json`` -> failed) into the
-    ``PodGuard``. After that first raise, or after ``shield()`` (the guarded block has ended and its cleanup is
-    running), a SIGTERM is logged and ignored: ``docker stop`` can repeat it, and the state save and the pod
-    DELETE it would interrupt are what it is asking for.
+    ``PodGuard``. Later SIGTERMs, and any after ``shield()`` (the guarded block has ended and its cleanup is
+    running), are logged and ignored: ``docker stop`` can repeat it, and the state save and the pod DELETE it
+    would interrupt are what it is asking for.
+
+    ``received`` stays set, so a ``Terminated`` that third-party code swallowed (a library catching
+    ``Exception``, e.g. ``logging.Handler.handleError`` around ``emit``) is raised again at the next
+    checkpoint: ``raise_if_sigterm_received`` (every iteration end, after training) and the guarded block's end.
     """
 
     def __init__(self) -> None:
-        self._armed = True
+        self.received = False
+        self._shielded = False
 
     def shield(self) -> None:
-        self._armed = False
+        self._shielded = True
 
     def __call__(self, signum: int, _frame: object) -> None:
         require(signum == signal.SIGTERM, f"SigtermHandler installed for signal {signum}")
-        if not self._armed:
+        if self._shielded or self.received:
             log.warning("SIGTERM again while stopping; finishing the cleanup first")
             return
-        self._armed = False
+        self.received = True
         raise Terminated(f"received SIGTERM (signal {signum}); stopping")
+
+    def raise_if_received(self) -> None:
+        """Raise ``Terminated`` again if a SIGTERM came in: its first ``Terminated`` was caught on the way."""
+        if self.received:
+            raise Terminated(
+                f"received SIGTERM (signal {int(signal.SIGTERM)}) earlier, and something caught its Terminated; stopping"
+            )
+
+
+def raise_if_sigterm_received() -> None:
+    """``SigtermHandler.raise_if_received`` of the installed handler; a no-op outside ``sigterm_raises``."""
+    handler = signal.getsignal(signal.SIGTERM)
+    if isinstance(handler, SigtermHandler):
+        handler.raise_if_received()
 
 
 @contextmanager

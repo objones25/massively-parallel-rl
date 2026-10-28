@@ -36,7 +36,7 @@ from mprl.config import RunSpec, batch_arithmetic
 from mprl.errors import ConfigMismatch, Terminated
 from mprl.negative_space import expect, require
 from mprl.paths import RunPaths
-from mprl.publish import export_onnx, hub_path, upload_run
+from mprl.publish import export_onnx, hub_path, raise_if_sigterm_received, upload_run
 from mprl.run_state import RunState, load_state, save_state
 from mprl.tasks import load_task_env_cfg, load_task_rl_cfg
 from mprl.wandb_writer import logger_cfg
@@ -287,6 +287,7 @@ def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:
     )
     try:
         final, train_seconds, errors = _train(spec, paths, deps, logger, latest)
+        raise_if_sigterm_received()  # a Terminated caught inside training (by a library) still fails the run
     except BaseException:
         state.status = "failed"
         save_state(paths.state_file, state)
@@ -331,7 +332,12 @@ def _learn(
     fresh_start: bool,
 ) -> tuple[CheckpointRef, float, dict[str, str]]:
     saved: list[CheckpointRef] = []
-    diag, on_before_update, on_iteration = diagnostics.for_runner(runner, deps.diagnostics_every_k)
+    diag, on_before_update, diag_on_iteration = diagnostics.for_runner(runner, deps.diagnostics_every_k)
+
+    def on_iteration(it: int) -> None:
+        raise_if_sigterm_received()  # stop at the iteration end even if a library swallowed the Terminated
+        diag_on_iteration(it)
+
     diag.attach()
     try:
         result = runner.learn_for(

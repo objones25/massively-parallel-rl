@@ -8,6 +8,7 @@ below is computed by hand from the Gaussian density.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,7 +16,7 @@ from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from mprl.diagnostics import PpoHealth, approx_kl, clip_fraction, explained_variance
+from mprl.diagnostics import PpoHealth, approx_kl, clip_fraction, explained_variance, for_runner
 from mprl.negative_space import CheckFailed
 
 LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
@@ -228,3 +229,84 @@ def test_snapshot_holds_only_the_actor_observations() -> None:
     health.before_update(0)
 
     assert health.snapshot_bytes == 4 * (6 * (OBS_DIM + 1 + 1) + 2 * 6)
+
+
+# --- a diverging run: metrics must never stop training ---------------------------------------------------
+
+
+def test_kl_beyond_the_float32_range_is_still_finite() -> None:
+    """log r = 100: expm1 overflows float32 above ~88.7; the estimator works in float64."""
+    old, new = torch.zeros(2), torch.full((2,), 100.0)
+
+    assert float(approx_kl(old, new)) == pytest.approx(math.expm1(100.0) - 100.0, rel=1e-9)
+
+
+def test_overflowing_kl_is_omitted_with_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """log r = 1000 overflows even float64: the key is dropped, the clip fraction (still defined) is kept."""
+    actor = _actor()
+    storage = _filled_storage(actor, 3, 2, old_log_prob=torch.full((2, 3), _log_prob_at_mean(1.0) - 1000.0))
+    health = _health(actor, storage)
+    health.before_update(0)
+
+    metrics = health.after_update(0)
+
+    assert metrics == {"Diag/clip_fraction": pytest.approx(1.0)}
+    assert "Diag/approx_kl=inf" in caplog.text
+
+
+def test_non_finite_explained_variance_is_omitted_with_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    actor = _actor()
+    storage = _filled_storage(
+        actor,
+        2,
+        2,
+        old_log_prob=torch.full((2, 2), _log_prob_at_mean(1.0)),
+        values=torch.tensor([[math.inf, 2.0], [3.0, 3.0]]),
+        returns=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
+    health = _health(actor, storage)
+    health.before_update(0)
+
+    metrics = health.after_update(0)
+
+    assert set(metrics) == {"Diag/approx_kl", "Diag/clip_fraction"}
+    assert "Diag/explained_variance=" in caplog.text
+
+
+# --- for_runner wiring ---------------------------------------------------------------------------------
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.scalars: dict[str, float] = {}
+
+    def add_scalar(self, tag: str, value: float, step: int) -> None:
+        self.scalars[f"{tag}@{step}"] = value
+
+
+def test_for_runner_uses_the_algorithms_clip_param() -> None:
+    """std 1 -> 1.15 with actions at the mean: r = 1/1.15, |r - 1| = 0.13, clipped at 0.1 but not at 0.2."""
+    actor = _actor()
+    critic = MLPModel(_obs(1), {"actor": ["policy"], "critic": ["policy"]}, "critic", 1, hidden_dims=(4,))
+    storage = _filled_storage(actor, 3, 2, old_log_prob=torch.full((2, 3), _log_prob_at_mean(1.0)))
+    writer = _Recorder()
+    alg = SimpleNamespace(
+        get_policy=lambda: actor, critic=critic, max_grad_norm=1.0, storage=storage, clip_param=0.1
+    )
+    runner = SimpleNamespace(
+        alg=alg, logger=SimpleNamespace(writer=writer), env=SimpleNamespace(get_observations=lambda: _obs(3)),
+        device="cpu",
+    )  # fmt: skip
+    diag, on_before_update, on_iteration = for_runner(runner, every_k=1)  # type: ignore[arg-type]  duck-typed
+    diag.attach()
+    on_before_update(0)
+    obs = _obs(3)
+    loss = actor.mlp(actor.get_latent(obs)).sum() + critic(obs).sum() + actor.distribution.std_param.sum()  # type: ignore[union-attr]
+    loss.backward()  # the update's backward, which the gradient hooks need
+    _set_std(actor, 1.15)  # the update's step
+    with torch.no_grad():  # update() leaves the distribution over its last minibatch (ppo.py:221)
+        actor.distribution.update(actor.mlp(actor.get_latent(obs)))  # type: ignore[union-attr]
+
+    on_iteration(0)
+
+    assert writer.scalars["Diag/clip_fraction@0"] == pytest.approx(1.0)

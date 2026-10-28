@@ -37,11 +37,21 @@ are computed here, keyed ``Diag/approx_kl``, ``Diag/clip_fraction`` and ``Diag/e
   ``update()`` leaves it over its last minibatch; the next ``act()`` replaces it.
 
 These measure the whole update (rollout policy -> final policy), not a per-minibatch mean as SB3 and
-CleanRL log; rsl_rl's adaptive learning rate uses an analytic per-minibatch KL it does not return.
+CleanRL log; rsl_rl's adaptive learning rate uses an analytic per-minibatch KL it does not return. The
+old log-probs were taken during the rollout with the observation normalizer as it was at each step
+(it updates every step, ``ppo.py:133``); the recomputation uses the post-rollout normalizer, so the KL
+and clip fraction include that drift, exactly as PPO's own ratio in ``update()`` does (``ppo.py:221-262``).
+
+A diagnostic never stops a paid run: the ratio math runs in float64 (``expm1`` overflows float32 at a
+log-ratio of ~88.7, reachable by a diverging run or a collapsed std), and any metric that is still not
+finite is dropped with a warning (``_finite_only``). Shapes, sizes and call order stay ``require``-checked:
+those are programmer errors.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -59,11 +69,25 @@ if TYPE_CHECKING:
     from tensordict import TensorDict
     from torch.utils.hooks import RemovableHandle
 
+log = logging.getLogger(__name__)
+
 _MAX_BACKWARDS = 256  # PPO backwards per update = num_learning_epochs * num_mini_batches (G1: 5 * 4)
 _ELU_SATURATED_BELOW = -0.99  # ELU(alpha=1) floors at -1
 _RATIO_EPS = 1e-8  # zero-initialised biases would otherwise divide by zero
 _MODULES = ("actor", "critic")
 PPO_MAX_SAMPLES: Final = 16_384  # rows kept for the KL / clip-fraction recomputation (memory: module docstring)
+
+
+def _finite_only(metrics: dict[str, float]) -> dict[str, float]:
+    """``metrics`` without its non-finite values, each dropped one named in a warning (a diverging run)."""
+    dropped = {key: value for key, value in metrics.items() if not math.isfinite(value)}
+    if dropped:
+        log.warning(
+            "dropping %d non-finite diagnostic(s), is the run diverging? %s",
+            len(dropped),
+            ", ".join(f"{key}={value}" for key, value in sorted(dropped.items())),
+        )
+    return {key: value for key, value in metrics.items() if key not in dropped}
 
 
 class TrainingDiagnostics:
@@ -162,9 +186,7 @@ class TrainingDiagnostics:
                 metrics[f"Diag/update_ratio/{module}/{name}"] = delta / (
                     float(torch.linalg.vector_norm(before)) + _RATIO_EPS
                 )
-        for key, value in metrics.items():
-            check_finite(value, key)
-        return metrics
+        return _finite_only(metrics)
 
     def activation_stats(self, obs: TensorDict | torch.Tensor) -> dict[str, float]:
         """Per-ELU-layer mean, std and saturated fraction of both models, plus policy-level scalars."""
@@ -196,9 +218,7 @@ class TrainingDiagnostics:
                     normalizer = actor.obs_normalizer
                     metrics["Diag/obs_norm_mean_abs"] = float(normalizer.mean.abs().mean())  # type: ignore[union-attr]
                     metrics["Diag/obs_norm_std_mean"] = float(normalizer.std.mean())  # type: ignore[union-attr]
-        for key, value in metrics.items():
-            check_finite(value, key)
-        return metrics
+        return _finite_only(metrics)
 
 
 def _check_log_probs(old_log_prob: torch.Tensor, new_log_prob: torch.Tensor) -> None:
@@ -216,7 +236,7 @@ def approx_kl(old_log_prob: torch.Tensor, new_log_prob: torch.Tensor) -> torch.T
     non-negative per sample, unlike ``mean(-log r)``. A 0-dim tensor; no device sync.
     """
     _check_log_probs(old_log_prob, new_log_prob)
-    log_ratio = new_log_prob - old_log_prob
+    log_ratio = new_log_prob.double() - old_log_prob.double()  # float64: finite up to log r ~ 709
     return (torch.expm1(log_ratio) - log_ratio).mean()
 
 
@@ -224,22 +244,21 @@ def clip_fraction(old_log_prob: torch.Tensor, new_log_prob: torch.Tensor, clip_p
     """Fraction of samples whose ratio left PPO's clip range: ``mean(|r - 1| > clip_param)``. 0-dim, no sync."""
     _check_log_probs(old_log_prob, new_log_prob)
     require(clip_param > 0.0, f"clip_param must be positive, got {clip_param}")
-    ratio = torch.exp(new_log_prob - old_log_prob)
-    return ((ratio - 1.0).abs() > clip_param).float().mean()
+    ratio = torch.exp(new_log_prob.double() - old_log_prob.double())
+    return ((ratio - 1.0).abs() > clip_param).double().mean()
 
 
 def explained_variance(values: torch.Tensor, returns: torch.Tensor) -> float | None:
     """``1 - Var(returns - values) / Var(returns)`` (population variances); None when the returns are constant.
 
-    1 is a perfect critic, 0 no better than the mean return, negative worse. One device sync.
+    1 is a perfect critic, 0 no better than the mean return, negative worse. Non-finite inputs give a
+    non-finite result for the caller to drop. One device sync.
     """
     require(values.shape == returns.shape, f"values {tuple(values.shape)} != returns {tuple(returns.shape)}")
     require(returns.numel() > 1, "explained variance needs at least 2 samples")
     var_residual, var_returns = torch.stack(
         [(returns - values).var(correction=0), returns.var(correction=0)]
     ).tolist()
-    check_finite(var_returns, "Var(returns)")
-    check_finite(var_residual, "Var(returns - values)")
     if var_returns == 0.0:
         return None
     return 1.0 - var_residual / var_returns
@@ -334,11 +353,7 @@ class PpoHealth:
         ev = explained_variance(snapshot.values, snapshot.returns)
         if ev is not None:
             metrics["Diag/explained_variance"] = ev
-        for key, value in metrics.items():
-            check_finite(value, key)
-        require(metrics["Diag/approx_kl"] >= -1e-6, f"approx KL {metrics['Diag/approx_kl']} < 0: k3 is non-negative")
-        require(0.0 <= metrics["Diag/clip_fraction"] <= 1.0, f"clip fraction {metrics['Diag/clip_fraction']}")
-        return metrics
+        return _finite_only(metrics)
 
 
 def for_runner(

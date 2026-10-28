@@ -18,7 +18,7 @@ import pytest
 import mprl.cli as cli
 import mprl.runpod as runpod_mod
 from mprl.budget import CostEstimate, Measurements, save_measurements
-from mprl.errors import BudgetExceeded, OwnPodUnknown, TerminateFailed
+from mprl.errors import BudgetExceeded, OwnPodUnknown, Terminated, TerminateFailed
 from mprl.results import build_results
 from mprl.run_state import RunState
 from mprl.runpod import PodTerminator
@@ -480,4 +480,40 @@ def test_sigterm_after_a_successful_body_is_ignored_until_the_pod_is_terminated(
     assert _main(*TRAINING_ARGV["train-run"]) == 0
 
     terminator.terminate.assert_called_once_with()
+    assert sigterm_sentinel == []
+
+
+def _sigterm_swallowed(result: object) -> Any:
+    """A body whose library catches Exception around the frame SIGTERM landed in, then returns ``result``."""
+
+    def body(*_args: object, **_kwargs: object) -> object:
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Terminated:
+            pass  # as logging.Handler.handleError does around emit()
+        return result
+
+    return body
+
+
+GUARDED_RESULTS: dict[str, object] = {"train-run": STATE, "pilot": STATE, "sweep": [STATE], "results-terminate": "out"}
+
+
+@pytest.mark.parametrize("command", list(GUARDED_ARGV))
+def test_swallowed_sigterm_is_still_a_failure_exit(
+    command: str,
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sigterm_sentinel: list[int],
+) -> None:
+    name, body = GUARDED_BODIES[command]
+    monkeypatch.setattr(cli, name, create_autospec(body, side_effect=_sigterm_swallowed(GUARDED_RESULTS[command])))
+    _measured(root)
+
+    assert _main(*GUARDED_ARGV[command]) == 1
+
+    terminator.terminate.assert_called_once_with()
+    assert "mprl: Terminated: received SIGTERM" in capsys.readouterr().err
     assert sigterm_sentinel == []

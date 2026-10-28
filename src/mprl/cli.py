@@ -89,6 +89,7 @@ def _pod_guard(no_terminate: bool, hint: str = _NO_TERMINATE_HINT) -> Generator[
         with sigterm_raises() as sigterm, PodGuard(terminator, interactive=_interactive()) as guard:
             try:
                 yield guard
+                sigterm.raise_if_received()  # a SIGTERM whose Terminated the block swallowed is still a failure
             finally:
                 sigterm.shield()  # the guard's cleanup (summary, os.sync, DELETE) runs to the end
 

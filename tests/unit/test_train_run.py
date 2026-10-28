@@ -303,6 +303,68 @@ def test_sigterm_mid_training_leaves_the_run_failed_before_the_pod_guard_termina
     assert events == [("DELETE", ("failed", ["model_it0000001_s000001.pt"]))]
 
 
+@pytest.mark.usefixtures("sigterm_sentinel")
+def test_swallowed_sigterm_in_training_still_leaves_the_run_failed(tmp_path: Path, train: MagicMock) -> None:
+    """A library inside training caught the Terminated; train_run must still fail the run before the DELETE."""
+    paths = RunPaths(tmp_path, SPEC)
+    events: list[tuple[str, object]] = []
+
+    def swallowing_training(*_args: object) -> tuple[CheckpointRef, float, dict[str, str]]:
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Terminated:
+            pass
+        return _finished_run(tmp_path), 2.0, {}
+
+    train.side_effect = swallowing_training
+
+    with (
+        pytest.raises(Terminated, match=r"^received SIGTERM"),
+        sigterm_raises(),
+        PodGuard(runpod_terminator(paths, events, lambda state: state.status), interactive=False),
+    ):
+        train_run(SPEC, tmp_path, DEPS)
+
+    assert events == [("DELETE", "failed")]
+
+
+class _RunnerSwallowingSigterm:
+    """Duck-types ``TimedOnPolicyRunner``: SIGTERM is swallowed during iteration 0, then the loop would go on."""
+
+    current_learning_iteration = 0
+
+    def __init__(self) -> None:
+        self.iterations_finished: list[int] = []
+
+    def learn_for(self, *_args: object, on_iteration: Callable[[int], None], **_kwargs: object) -> None:
+        for it in range(3):
+            if it == 0:
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                except Terminated:
+                    pass
+            on_iteration(it)
+            self.iterations_finished.append(it)
+
+
+@pytest.mark.usefixtures("sigterm_sentinel")
+def test_swallowed_sigterm_stops_training_at_the_next_iteration_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        train_mod.diagnostics, "for_runner", lambda *_args: (_StubDiagnostics(), lambda _it: None, lambda _it: None)
+    )
+    runner = _RunnerSwallowingSigterm()
+    budget_s = SPEC.budget_minutes * 60.0
+
+    with pytest.raises(Terminated, match=r"^received SIGTERM"), sigterm_raises():
+        train_mod._learn(  # type: ignore[arg-type]  duck-typed runner
+            SPEC, RunPaths(tmp_path, SPEC), DEPS, runner, TrainingClock(), budget_s, fresh_start=True
+        )
+
+    assert runner.iterations_finished == []
+
+
 class _StubDiagnostics:
     def attach(self) -> None: ...
     def detach(self) -> None: ...
