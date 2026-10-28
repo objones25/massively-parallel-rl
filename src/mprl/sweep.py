@@ -2,7 +2,8 @@
 
 ``run_sweep`` in order:
 
-1. Counts with ``m.fits[n] is False`` are removed and the reason (CUDA OOM, plus the steps/s measured
+1. A count absent from ``m.fits`` raises ``MeasurementMissing`` (unmeasured counts never train).
+   Counts with ``m.fits[n] is False`` are removed and the reason (CUDA OOM, plus the steps/s measured
    for the counts that fit) is recorded in ``sweep_results_dir/sweep_manifest.json``. If 64 or the
    long-run count does not fit, ``EnvDoesNotFit`` is raised instead.
 2. ``plan_within_budget`` applies the cut order; the estimate is printed. If any cut was applied,
@@ -16,7 +17,8 @@
    pilot is ``complete`` with at least 45 training minutes, or this same reuse was already recorded
    (the long run, resuming the pilot past 45 minutes, may have crashed). The reuse is written to
    ``sweep_results_dir/pilot_reuse.json`` (results read that run's checkpoints up to 45 minutes) and
-   the run is skipped.
+   the run is skipped. When no reuse is accepted, a ``pilot_reuse.json`` left by an earlier
+   invocation is removed, since that run now trains for real.
 4. Every remaining run trains through ``train_run`` (count-major), then the long run, which resumes
    the pilot. ``finish_and_terminate`` runs in a ``finally``: a crash still terminates the pod, then
    re-raises.
@@ -33,7 +35,7 @@ from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any, Final
 
 from mprl.budget import NEVER_DROPPED, CostEstimate, Measurements, plan_within_budget
-from mprl.errors import EnvDoesNotFit
+from mprl.errors import EnvDoesNotFit, MeasurementMissing
 from mprl.negative_space import require
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.publish import finish_and_terminate
@@ -114,6 +116,10 @@ def run_sweep(
     )
     if reused:
         write_json_atomic(results / _PILOT_REUSE, reused)
+    else:
+        # A reuse recorded by an earlier invocation no longer holds: this run trains for real, and a
+        # stale file would give results two sources for it.
+        (results / _PILOT_REUSE).unlink(missing_ok=True)
 
     specs = [spec for spec in planned.runs() if spec.run_id not in reused] + [planned.long_run()]
     require(len(specs) == len(planned.runs()) - len(reused) + 1, f"reused ids {sorted(reused)} are not sweep runs")
@@ -128,7 +134,16 @@ def run_sweep(
 
 
 def _exclude_unfit(sweep: SweepSpec, m: Measurements) -> tuple[SweepSpec, dict[int, str]]:
-    """``sweep`` without the counts measured not to fit, and the reason for each one removed."""
+    """``sweep`` without the counts measured not to fit, and the reason for each one removed.
+
+    Raises ``MeasurementMissing`` if a count was never measured: whether it fits is unknown.
+    """
+    missing = sorted(n for n in sweep.env_counts if n not in m.fits)
+    if missing:
+        raise MeasurementMissing(
+            f"sweep {sweep.name}: env counts {missing} have no throughput measurement; "
+            f"measured counts are {sorted(m.fits)}. Re-run the throughput test for them."
+        )
     fit_sps = ", ".join(f"{n}: {sps:.0f}" for n, sps in sorted(m.steps_per_second.items()))
     excluded = {
         n: (

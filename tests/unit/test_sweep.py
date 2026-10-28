@@ -15,7 +15,7 @@ import mprl.sweep as sweep_mod
 import mprl.train
 from mprl.budget import CostEstimate, Measurements
 from mprl.config import RunSpec, SweepSpec
-from mprl.errors import EnvDoesNotFit
+from mprl.errors import EnvDoesNotFit, MeasurementMissing
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.run_state import RunState, save_state
 from mprl.runpod import PodTerminator
@@ -29,6 +29,11 @@ SMALL = SweepSpec("main", env_counts=(64, 4096), seeds=(0, 1))
 
 def _m(io: float = 0.0) -> Measurements:
     return Measurements(0.0, io, {64: True, 4096: True}, {64: 900.0, 4096: 250_000.0})
+
+
+def _full_m(io: float = 0.0) -> Measurements:
+    counts = SweepSpec("main").env_counts
+    return Measurements(0.0, io, dict.fromkeys(counts, True), {n: 100.0 * n for n in counts})
 
 
 def _state(spec: RunSpec, *, train_seconds: float | None = None, sha: str = SHA, **overrides: Any) -> RunState:
@@ -122,7 +127,7 @@ def test_sweep_requires_confirmation_when_cuts_applied(
         return False
 
     states = run_sweep(
-        SweepSpec("main"), tmp_path, DEPS, _m(io=0.4), confirm=refuse, terminator=terminator, reuse_pilot=False
+        SweepSpec("main"), tmp_path, DEPS, _full_m(io=0.4), confirm=refuse, terminator=terminator, reuse_pilot=False
     )
 
     assert states == []
@@ -263,3 +268,30 @@ def test_run_pilot_trains_the_pilot_spec_then_terminates(
     train_run.assert_called_once_with(pilot_spec(SMALL), tmp_path, DEPS)
     assert state.run_id == SMALL.long_run().run_id
     terminator.terminate.assert_called_once_with()
+
+
+@pytest.mark.parametrize(("label", "head", "reuse"), [("no flag", SHA, False), ("other HEAD", "d" * 40, True)])
+def test_stale_pilot_reuse_is_removed_when_not_accepted(
+    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch, label: str, head: str, reuse: bool
+) -> None:
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+    reuse_file = sweep_results_dir(tmp_path, "main") / "pilot_reuse.json"
+    assert reuse_file.is_file()
+    monkeypatch.setattr(sweep_mod, "git_sha", lambda: head)
+    train_run.reset_mock()
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=reuse)
+
+    assert _reused_id() in _trained(train_run), label
+    assert not reuse_file.exists(), label
+
+
+def test_sweep_refuses_unmeasured_counts(tmp_path: Path, train_run: MagicMock, terminator: MagicMock) -> None:
+    sweep = SweepSpec("main", env_counts=(64, 256, 4096, 16384))
+
+    with pytest.raises(MeasurementMissing, match=r"\[256, 16384\]"):
+        run_sweep(sweep, tmp_path, DEPS, _m(), confirm=_yes, terminator=terminator, reuse_pilot=False)
+
+    train_run.assert_not_called()
+    terminator.terminate.assert_not_called()

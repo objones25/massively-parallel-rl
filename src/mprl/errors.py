@@ -33,3 +33,7 @@ class EnvDoesNotFit(MprlOperatingError):
 
 class MissingSecret(MprlOperatingError):
     """A required API key or token is absent from the environment."""
+
+
+class MeasurementMissing(MprlOperatingError):
+    """A sweep env count has no throughput measurement, so whether it fits is unknown."""

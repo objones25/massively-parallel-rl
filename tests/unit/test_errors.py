@@ -13,6 +13,7 @@ OPERATING_ERRORS = (
     errors.BudgetExceeded,
     errors.EnvDoesNotFit,
     errors.MissingSecret,
+    errors.MeasurementMissing,
 )
 
 

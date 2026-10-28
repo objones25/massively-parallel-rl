@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -49,3 +50,27 @@ def test_non_oom_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(RuntimeError, match="not an allocation failure"):
         measure_throughput((4,), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
+
+
+class _Payload:
+    """Stands in for the runner and rollout tensors a failing measurement holds."""
+
+
+def test_memory_released_after_oom_frame_is_gone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    refs: list[weakref.ref[_Payload]] = []
+    alive_at_release: list[bool] = []
+
+    def oom(num_envs: int, *args: Any, **kwargs: Any) -> Any:
+        payload = _Payload()  # a local of the failing frame, pinned by the traceback while it lives
+        refs.append(weakref.ref(payload))
+        raise torch.OutOfMemoryError(f"CUDA out of memory at num_envs={num_envs}")
+
+    monkeypatch.setattr(throughput_mod, "measure_count", oom)
+    monkeypatch.setattr(
+        throughput_mod, "_release_device_memory", lambda _device: alive_at_release.append(refs[-1]() is not None)
+    )
+
+    m = measure_throughput((4, 8), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
+
+    assert m.fits == {4: False, 8: False}
+    assert alive_at_release == [False, False]

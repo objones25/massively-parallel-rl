@@ -136,16 +136,20 @@ def measure_throughput(
     sps: dict[int, float] = {}
     overheads: list[float] = []
     for n in env_counts:
+        measured: CountMeasurement | None = None
         try:
             measured = measure_count(n, iterations, device, work_dir / f"n{n:05d}", checkpoint_every_minutes)
         except torch.OutOfMemoryError as error:
-            log.warning("num_envs=%d does not fit on %s: %s", n, device, error)
-            fits[n] = False
-            _release_device_memory(device)
+            # Log the text, not the exception: a handler that keeps LogRecords would keep its traceback.
+            log.warning("num_envs=%d does not fit on %s: %s", n, device, str(error))
+        # Released only here: inside the except, error.__traceback__ still pins the failed run's frames
+        # (runner, policy, rollout tensors), so nothing could be freed. Python drops `error` at the
+        # end of the except block.
+        _release_device_memory(device)
+        fits[n] = measured is not None
+        if measured is None:
             continue
-        fits[n] = True
         sps[n] = measured.steps_per_second
         overheads.append(measured.io_overhead_fraction)
         log.info("num_envs=%d: %.0f env steps/s, off-clock overhead %.3f", n, sps[n], overheads[-1])
-        _release_device_memory(device)
     return Measurements(eval_seconds_per_checkpoint, max(overheads, default=0.0), fits, sps)
