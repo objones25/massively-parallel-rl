@@ -7,10 +7,14 @@ HF checks are exercised against the real services in tests/network/test_prefligh
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import create_autospec
 
 import httpx
 import pytest
+import wandb
+from wandb.errors import AuthenticationError, CommError
 
+import mprl.preflight as preflight_mod
 from mprl.errors import MissingSecret, OwnPodUnknown, PreflightFailed
 from mprl.negative_space import require
 from mprl.preflight import (
@@ -133,3 +137,19 @@ def test_check_runpod_rejects_a_malformed_pod_id() -> None:
 def test_check_runpod_needs_the_api_key() -> None:
     with pytest.raises(MissingSecret, match="RUNPOD_API_KEY"):
         check_runpod({"RUNPOD_POD_ID": POD}, _client(200, {"status": "RUNNING"}, []))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AuthenticationError("Failed to verify credentials: the service process is busy and did not respond in time"),
+        CommError("network unreachable"),
+    ],
+)
+def test_check_wandb_maps_auth_and_network_failures(error: Exception, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(preflight_mod.wandb, "Api", create_autospec(wandb.Api, side_effect=error))
+
+    results = run_checks([("wandb", lambda: check_wandb({"WANDB_API_KEY": "k" * 40}))])
+
+    assert results[0].ok is False
+    assert results[0].detail.startswith("PreflightFailed: W&B")

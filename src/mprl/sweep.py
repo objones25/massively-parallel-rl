@@ -20,8 +20,8 @@
    the run is skipped. When no reuse is accepted, a ``pilot_reuse.json`` left by an earlier
    invocation is removed, since that run now trains for real.
 4. Every remaining run trains through ``train_run`` (count-major), then the long run, which resumes
-   the pilot. ``finish_and_terminate`` runs in a ``finally``: a crash still terminates the pod, then
-   re-raises.
+   the pilot, inside a ``PodGuard``: a crash still terminates the pod, then re-raises (a failed
+   termination is attached to it as a note).
 
 Refusing the confirmation or exceeding the cap returns or raises *before* any training and leaves the
 pod running, since the user is at the prompt.
@@ -38,7 +38,7 @@ from mprl.budget import NEVER_DROPPED, CostEstimate, Measurements, plan_within_b
 from mprl.errors import EnvDoesNotFit, MeasurementMissing
 from mprl.negative_space import require
 from mprl.paths import RunPaths, sweep_results_dir
-from mprl.publish import finish_and_terminate
+from mprl.publish import PodGuard
 from mprl.run_state import RunState, load_state, write_json_atomic
 from mprl.train import git_sha, train_run
 
@@ -64,13 +64,10 @@ def pilot_spec(sweep: SweepSpec) -> RunSpec:
 
 
 def run_pilot(sweep: SweepSpec, root: Path, deps: TrainDeps, *, terminator: PodTerminator | None) -> RunState:
-    """Train the pilot, then ``finish_and_terminate`` (also on a crash, which re-raises)."""
-    states: list[RunState] = []
-    try:
-        states.append(train_run(pilot_spec(sweep), root, deps))
-    finally:
-        finish_and_terminate(states, terminator)
-    return states[0]
+    """Train the pilot, then terminate the pod through ``PodGuard`` (also on a crash, which re-raises)."""
+    with PodGuard(terminator, interactive=False) as guard:
+        guard.states.append(train_run(pilot_spec(sweep), root, deps))
+    return guard.states[0]
 
 
 def run_sweep(
@@ -124,13 +121,10 @@ def run_sweep(
     specs = [spec for spec in planned.runs() if spec.run_id not in reused] + [planned.long_run()]
     require(len(specs) == len(planned.runs()) - len(reused) + 1, f"reused ids {sorted(reused)} are not sweep runs")
     require(all(spec.num_envs in planned.env_counts for spec in specs), "a run uses an excluded or cut env count")
-    states: list[RunState] = []
-    try:
+    with PodGuard(terminator, interactive=False) as guard:
         for spec in specs:
-            states.append(train_run(spec, root, deps))
-    finally:
-        finish_and_terminate(states, terminator)
-    return states
+            guard.states.append(train_run(spec, root, deps))
+    return guard.states
 
 
 def _exclude_unfit(sweep: SweepSpec, m: Measurements) -> tuple[SweepSpec, dict[int, str]]:

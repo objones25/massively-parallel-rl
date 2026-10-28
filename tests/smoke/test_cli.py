@@ -32,6 +32,7 @@ def _env(**extra: str) -> dict[str, str]:
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", "/tmp"),  # noqa: S108
         "PYTHONPATH": str(REPO / "src"),
+        "MPRL_ENV_FILE": str(REPO / "tests" / "no-such.env"),  # hermetic: never the developer's .env
         **extra,
     }
 
@@ -133,7 +134,9 @@ def test_throughput_writes_measurements_with_timed_eval(tmp_path: Path, monkeypa
     monkeypatch.setenv("MPRL_VOLUME_ROOT", str(root))
     (root / "throughput" / "stale").mkdir(parents=True)
 
-    code = cli.main(["throughput", "--counts", "4", "--iterations", "2", "--device", "cpu"], env_file=tmp_path / "no.env")
+    monkeypatch.setenv("MPRL_ENV_FILE", str(tmp_path / "no.env"))
+
+    code = cli.main(["throughput", "--counts", "4", "--iterations", "2", "--device", "cpu"])
 
     assert code == 0
     m = load_measurements(root / "measurements.json")
@@ -141,3 +144,13 @@ def test_throughput_writes_measurements_with_timed_eval(tmp_path: Path, monkeypa
     assert m.steps_per_second[4] > 0
     assert m.eval_seconds_per_checkpoint > 0
     assert not (root / "throughput" / "stale").exists()
+
+
+def test_env_file_override_is_loaded(tmp_path: Path) -> None:
+    env_file = tmp_path / "custom.env"
+    env_file.write_text(f"MPRL_VOLUME_ROOT={tmp_path / 'from-env-file'}\n")
+
+    done = _mprl("preflight", "--cpu", "--only", "volume", env={**_env(), "MPRL_ENV_FILE": str(env_file)})
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "from-env-file is writable" in done.stdout

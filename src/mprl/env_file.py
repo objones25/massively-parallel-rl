@@ -2,7 +2,8 @@
 
 ``.env.example`` format: a ``# comment`` block directly above each ``NAME=default`` line (an empty
 default means none). A comment block followed by a blank line belongs to no key. Values are written
-unquoted, so a value python-dotenv would alter (whitespace, quotes, ``#``, ``$``, backslash) is refused.
+unquoted, so a value python-dotenv would alter (whitespace, quotes, ``#``, ``$``, backslash) is refused
+with ``InvalidInput``.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from mprl.errors import InvalidInput
 from mprl.negative_space import bounded, expect, require
 
 _SECRET_SUFFIXES: Final = ("_KEY", "_TOKEN")
@@ -54,7 +56,7 @@ def parse_env_example(text: str) -> list[EnvVar]:
 
 def _check_value(name: str, value: str) -> None:
     if _SAFE_VALUE.fullmatch(value) is None:
-        raise ValueError(f"{name}: value must not contain whitespace, quotes, '#', '$', '`' or backslashes")
+        raise InvalidInput(f"{name}: value must not contain whitespace, quotes, '#', '$', '`' or backslashes")
 
 
 def render_env(vars: Sequence[EnvVar], values: Mapping[str, str]) -> str:
@@ -113,7 +115,7 @@ def prompt_values(
             value = (ask_secret if var.secret else ask)(prompt).strip() or current
             try:
                 _check_value(var.name, value)
-            except ValueError as error:
+            except InvalidInput as error:
                 if attempt == _MAX_ATTEMPTS - 1:
                     raise
                 print(f"{error}; try again")

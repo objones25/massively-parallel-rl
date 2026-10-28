@@ -1,13 +1,13 @@
 """The ``mprl`` command line (tyro subcommands). ``scripts/setup.sh`` and ``scripts/train.sh`` call it.
 
-``.env`` (repo root, written by ``setup``) is loaded at startup without overriding variables already set.
+``.env`` (``$MPRL_ENV_FILE``, default the repo root's, written by ``setup``) is loaded at startup without
+overriding variables already set.
 
-Termination: ``train-run``, ``pilot`` and ``sweep`` build the pod's ``PodTerminator`` before any training
-(no key or no pod id: refuse, naming ``--no-terminate``) and terminate the pod when training ends or fails.
-A sweep that stops before training (over budget, measurements missing, a required count does not fit, or
-cuts not confirmed) terminates the pod only when unattended (``--yes`` or no terminal); a user at the
-prompt keeps it. ``results`` terminates only with ``--terminate``; ``setup``, ``preflight`` and
-``throughput`` never do.
+Termination: ``train-run``, ``pilot`` and ``sweep`` build the pod's ``PodTerminator`` before anything else
+(no key or no pod id: refuse, naming ``--no-terminate``). From then on one ``PodGuard`` terminates the pod
+on any exit (success, a missing key, corrupt measurements, a crash) except a cut plan refused at the prompt
+and Ctrl-C at a terminal. ``results`` does the same only with ``--terminate``; ``setup``, ``preflight`` and
+``throughput`` never terminate.
 """
 
 from __future__ import annotations
@@ -17,10 +17,11 @@ import logging
 import os
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, get_args
+from typing import Final, Literal, get_args
 
 import httpx
 import torch
@@ -32,28 +33,18 @@ from mprl.budget import CostEstimate, load_measurements, save_measurements
 from mprl.config import RunSpec, SweepSpec
 from mprl.curves import METRICS
 from mprl.env_file import parse_env_example, prompt_values, render_env, write_env
-from mprl.errors import (
-    BudgetExceeded,
-    EnvDoesNotFit,
-    MeasurementMissing,
-    MissingSecret,
-    MprlOperatingError,
-    PreflightFailed,
-)
+from mprl.errors import EnvDoesNotFit, MeasurementMissing, MissingSecret, MprlOperatingError, PreflightFailed
 from mprl.evaluator import EvalConfig
 from mprl.hub import HubPublisher
 from mprl.negative_space import require
 from mprl.paths import volume_root
 from mprl.preflight import default_checks, run_checks
-from mprl.publish import finish_and_terminate
+from mprl.publish import PodGuard
 from mprl.results import build_results
-from mprl.runpod import PodTerminator, own_terminator
+from mprl.runpod import own_terminator
 from mprl.sweep import run_pilot, run_sweep
 from mprl.throughput import measure_eval_seconds, measure_throughput
 from mprl.train import TrainDeps, train_run
-
-if TYPE_CHECKING:
-    from mprl.run_state import RunState
 
 log = logging.getLogger(__name__)
 
@@ -75,14 +66,22 @@ def _interactive() -> bool:
     return sys.stdin.isatty()
 
 
-def _terminator(no_terminate: bool, hint: str = _NO_TERMINATE_HINT) -> PodTerminator | None:
-    """This pod's terminator, built (key and pod id checked) before anything is spent; None with ``no_terminate``."""
-    if no_terminate:
-        return None
-    try:
-        return own_terminator(os.environ, httpx.Client(timeout=_RUNPOD_TIMEOUT_S))
-    except MprlOperatingError as error:
-        raise type(error)(f"{error}; {hint}") from error
+def _env_file() -> Path:
+    return Path(os.environ.get("MPRL_ENV_FILE") or ENV_FILE)
+
+
+@contextmanager
+def _pod_guard(no_terminate: bool, hint: str = _NO_TERMINATE_HINT) -> Generator[PodGuard]:
+    """Build this pod's terminator (key and pod id checked) first, then guard the block with it."""
+    with httpx.Client(timeout=_RUNPOD_TIMEOUT_S) as client:
+        terminator = None
+        if not no_terminate:
+            try:
+                terminator = own_terminator(os.environ, client)
+            except MprlOperatingError as error:
+                raise type(error)(f"{error}; {hint}") from error
+        with PodGuard(terminator, interactive=_interactive()) as guard:
+            yield guard
 
 
 def _deps(device: str, wandb_mode: str) -> TrainDeps:
@@ -103,10 +102,11 @@ class Setup:
 
     def run(self) -> int:
         vars = parse_env_example(ENV_EXAMPLE.read_text())
-        existing = dotenv_values(ENV_FILE) if ENV_FILE.exists() else {}
+        env_file = _env_file()
+        existing = dotenv_values(env_file) if env_file.exists() else {}
         values = prompt_values(vars, existing, ask=input, ask_secret=getpass.getpass)
-        write_env(ENV_FILE, render_env(vars, values), overwrite=True)
-        print(f"wrote {ENV_FILE} (mode 0600)")
+        write_env(env_file, render_env(vars, values), overwrite=True)
+        print(f"wrote {env_file} (mode 0600)")
         return _preflight({**os.environ, **values}, require_gpu=not self.cpu, only=())
 
 
@@ -171,14 +171,10 @@ class TrainRun:
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
-        terminator = _terminator(self.no_terminate)
-        deps = _deps(self.device, self.wandb_mode)
-        states: list[RunState] = []
-        try:
+        with _pod_guard(self.no_terminate) as guard:
+            deps = _deps(self.device, self.wandb_mode)
             spec = RunSpec(self.sweep, self.num_envs, self.seed, self.minutes)
-            states.append(train_run(spec, volume_root(os.environ), deps))
-        finally:
-            finish_and_terminate(states, terminator)
+            guard.states.append(train_run(spec, volume_root(os.environ), deps))
         return 0
 
 
@@ -193,9 +189,9 @@ class Pilot:
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
-        terminator = _terminator(self.no_terminate)
-        deps = _deps(self.device, self.wandb_mode)
-        run_pilot(SweepSpec(self.name), volume_root(os.environ), deps, terminator=terminator)
+        with _pod_guard(self.no_terminate) as guard:
+            deps = _deps(self.device, self.wandb_mode)
+            guard.states.append(run_pilot(SweepSpec(self.name), volume_root(os.environ), deps, terminator=None))
         return 0
 
 
@@ -224,31 +220,25 @@ class Sweep:
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
-        terminator = _terminator(self.no_terminate)
-        deps = _deps(self.device, self.wandb_mode)
-        attended = _interactive() and not self.yes
         root = volume_root(os.environ)
-        try:
+        with _pod_guard(self.no_terminate) as guard:
+            deps = _deps(self.device, self.wandb_mode)
             if not (root / MEASUREMENTS).is_file():
                 raise MeasurementMissing(f"{root / MEASUREMENTS} does not exist; run `mprl throughput` first")
-            states = run_sweep(
+            guard.states += run_sweep(
                 SweepSpec(self.name),
                 root,
                 deps,
                 load_measurements(root / MEASUREMENTS),
                 confirm=lambda est, cuts: _confirm(est, cuts, yes=self.yes),
-                terminator=terminator,
+                terminator=None,  # the guard terminates, once, on every exit
                 reuse_pilot=self.reuse_pilot,
             )
-        except (BudgetExceeded, MeasurementMissing, EnvDoesNotFit):
-            if not attended:
-                finish_and_terminate([], terminator)
-            raise
-        if not states:
-            print(f"sweep {self.name}: cuts not confirmed; nothing trained")
-            if not attended:
-                finish_and_terminate([], terminator)
-            return 1
+            if not guard.states:
+                print(f"sweep {self.name}: cuts not confirmed; nothing trained")
+                if _interactive() and not self.yes:
+                    guard.keep("the cut plan was refused at the prompt")
+                return 1
         return 0
 
 
@@ -265,9 +255,8 @@ class Results:
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
-        terminator = _terminator(not self.terminate, "omit --terminate to keep the pod running")
-        deps = _deps(self.device, self.wandb_mode)
-        try:
+        with _pod_guard(not self.terminate, "omit --terminate to keep the pod running"):
+            deps = _deps(self.device, self.wandb_mode)
             out = build_results(
                 SweepSpec(self.name),
                 volume_root(os.environ),
@@ -277,8 +266,6 @@ class Results:
                 device=self.device,
             )
             print(f"results in {out}")
-        finally:
-            finish_and_terminate([], terminator)
         return 0
 
 
@@ -293,14 +280,15 @@ COMMANDS: Final = {
 }
 
 
-def main(argv: Sequence[str] | None = None, *, env_file: Path = ENV_FILE) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    load_dotenv(env_file, override=False)
+    load_dotenv(_env_file(), override=False)
     command = tyro.extras.subcommand_cli_from_dict(
         COMMANDS, prog="mprl", args=argv, config=(tyro.conf.FlagCreatePairsOff,)
     )
     try:
         return command.run()
     except MprlOperatingError as error:
-        print(f"mprl: {type(error).__name__}: {error}", file=sys.stderr)
+        notes = "".join(f"\n  {note}" for note in getattr(error, "__notes__", []))
+        print(f"mprl: {type(error).__name__}: {error}{notes}", file=sys.stderr)
         return 1

@@ -15,7 +15,7 @@ import pytest
 import mprl.cli as cli
 import mprl.runpod as runpod_mod
 from mprl.budget import CostEstimate, Measurements, save_measurements
-from mprl.errors import BudgetExceeded, OwnPodUnknown
+from mprl.errors import BudgetExceeded, OwnPodUnknown, TerminateFailed
 from mprl.results import build_results
 from mprl.run_state import RunState
 from mprl.runpod import PodTerminator
@@ -32,6 +32,7 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("MPRL_VOLUME_ROOT", str(volume))
     monkeypatch.setenv("HF_TOKEN", "hf_test")
     monkeypatch.setenv("HF_REPO_ID", "user/repo")
+    monkeypatch.setenv("MPRL_ENV_FILE", str(tmp_path / "no.env"))
     monkeypatch.setattr(cli, "_interactive", lambda: False)
     return volume
 
@@ -45,7 +46,7 @@ def terminator(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 def _main(tmp_path: Path, *argv: str) -> int:
-    return cli.main(list(argv), env_file=tmp_path / "no.env")
+    return cli.main(list(argv))
 
 
 def _measured(root: Path) -> None:
@@ -70,7 +71,7 @@ def test_sweep_budget_exceeded_unattended_terminates(
     assert "over the $40 cap" in capsys.readouterr().err
 
 
-def test_sweep_budget_exceeded_attended_leaves_pod(
+def test_sweep_budget_exceeded_attended_still_terminates(
     tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _measured(root)
@@ -79,7 +80,99 @@ def test_sweep_budget_exceeded_attended_leaves_pod(
 
     assert _main(tmp_path, "sweep", "--name", "main") == 1
 
-    terminator.terminate.assert_not_called()
+    terminator.terminate.assert_called_once_with()
+
+
+def test_sweep_corrupt_measurements_terminates(
+    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root.mkdir(parents=True)
+    (root / "measurements.json").write_text("{not json")
+    sweep = _sweep_double(monkeypatch)
+
+    with pytest.raises(ValueError, match="Expecting property name"):
+        _main(tmp_path, "sweep", "--name", "main")
+
+    sweep.assert_not_called()
+    terminator.terminate.assert_called_once_with()
+
+
+TRAINING_ARGV = {
+    "train-run": ("train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "0", "--minutes", "3"),
+    "pilot": ("pilot",),
+    "sweep": ("sweep", "--name", "main"),
+}
+
+
+@pytest.mark.parametrize("command", list(TRAINING_ARGV))
+def test_missing_hf_key_terminates(
+    command: str,
+    tmp_path: Path,
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("HF_TOKEN")
+    _measured(root)
+
+    assert _main(tmp_path, *TRAINING_ARGV[command]) == 1
+
+    terminator.terminate.assert_called_once_with()
+    assert "HF_TOKEN" in capsys.readouterr().err
+
+
+def test_training_error_terminates_then_propagates(
+    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _main(tmp_path, *TRAINING_ARGV["train-run"])
+
+    terminator.terminate.assert_called_once_with()
+
+
+def test_failed_termination_keeps_the_original_error(
+    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=RuntimeError("boom")))
+    terminator.terminate.side_effect = TerminateFailed("DELETE of pod p failed with HTTP 500")
+
+    with pytest.raises(RuntimeError, match="boom") as info:
+        _main(tmp_path, *TRAINING_ARGV["train-run"])
+
+    assert info.value.__notes__ == ["pod termination also failed: TerminateFailed: DELETE of pod p failed with HTTP 500"]
+
+
+def test_main_prints_the_termination_failure_with_an_operating_error(
+    tmp_path: Path,
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("HF_REPO_ID")
+    terminator.terminate.side_effect = TerminateFailed("DELETE of pod p failed with HTTP 500")
+
+    assert _main(tmp_path, *TRAINING_ARGV["pilot"]) == 1
+
+    err = capsys.readouterr().err
+    assert "MissingSecret: HF_REPO_ID is not set" in err
+    assert "pod termination also failed: TerminateFailed: DELETE of pod p failed with HTTP 500" in err
+
+
+@pytest.mark.parametrize(("tty", "terminated"), [(True, False), (False, True)])
+def test_keyboard_interrupt_terminates_only_without_a_terminal(
+    tty: bool, terminated: bool, tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=KeyboardInterrupt()))
+    monkeypatch.setattr(cli, "_interactive", lambda: tty)
+
+    with pytest.raises(KeyboardInterrupt):
+        _main(tmp_path, *TRAINING_ARGV["train-run"])
+
+    assert terminator.terminate.called is terminated
 
 
 def test_sweep_without_measurements_terminates_before_training(
@@ -155,8 +248,8 @@ def test_yes_confirms_after_printing_the_plan(
     assert "two_seeds" in out
     assert EST.describe() in out
     assert sweep.call_args.kwargs["reuse_pilot"] is True
-    assert sweep.call_args.kwargs["terminator"] is terminator
-    terminator.terminate.assert_not_called()  # run_sweep itself terminates after training
+    assert sweep.call_args.kwargs["terminator"] is None  # the CLI's guard owns termination
+    terminator.terminate.assert_called_once_with()
 
 
 def test_train_run_refuses_before_training_without_pod_id(

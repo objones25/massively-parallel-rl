@@ -5,9 +5,11 @@ unwritable volume) into ``ok=False`` with the error as the detail; anything else
 included, propagates. Each service check converts that service's documented failure exceptions into
 ``PreflightFailed``:
 
-- W&B (wandb 0.31.0): ``wandb.Api(api_key=...).viewer`` raises ``wandb.errors.Error`` subclasses
-  (``AuthenticationError`` for a bad key, observed), ``WandbApiFailedError`` or ``ValueError``
-  (documented on ``Api.viewer``).
+- W&B (wandb 0.31.0): ``wandb.Api(api_key=..., timeout=...)`` verifies the key while it is built and
+  raises ``wandb.errors.AuthenticationError`` (a ``CommError``, so a ``wandb.errors.Error``) both for a bad
+  key and when the server is unreachable (observed 2026-10-28 with a bogus key, a closed localhost port
+  and an unresolvable host; the outage case after ``timeout`` seconds). ``.viewer`` documents
+  ``WandbApiFailedError`` and ``ValueError``. All of these become ``PreflightFailed``.
 - Hugging Face (huggingface_hub 2.3.0): ``HfHubHTTPError`` (a bad token: 401, observed) and
   ``httpx2.TransportError``; ``HubPublisher.ensure_repo`` raises ``UploadFailed`` after its retries.
 - RunPod: ``PodTerminator.status`` raises ``TerminateFailed`` for a non-200/404 reply or exhausted retries.
@@ -48,6 +50,7 @@ _ENV_CHECK_NUM_ENVS: Final = 2
 _ENV_CHECK_STEPS: Final = 4
 _GPU_DEVICE: Final = "cuda:0"
 _RUNPOD_TIMEOUT_S: Final = 30.0
+_WANDB_TIMEOUT_S: Final = 30
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,7 @@ def check_env(device: str) -> str:
 def check_wandb(env: Mapping[str, str]) -> str:
     key = _secret(env, "WANDB_API_KEY")
     try:
-        viewer = wandb.Api(api_key=key).viewer
+        viewer = wandb.Api(api_key=key, timeout=_WANDB_TIMEOUT_S).viewer
         username, entity = viewer.username, viewer.entity
     except (WandbError, WandbApiFailedError, ValueError) as error:
         raise PreflightFailed(f"W&B rejected WANDB_API_KEY: {type(error).__name__}: {error}") from error

@@ -15,7 +15,7 @@ import mprl.sweep as sweep_mod
 import mprl.train
 from mprl.budget import CostEstimate, Measurements
 from mprl.config import RunSpec, SweepSpec
-from mprl.errors import EnvDoesNotFit, MeasurementMissing
+from mprl.errors import EnvDoesNotFit, MeasurementMissing, TerminateFailed
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.run_state import RunState, save_state
 from mprl.runpod import PodTerminator
@@ -295,3 +295,27 @@ def test_sweep_refuses_unmeasured_counts(tmp_path: Path, train_run: MagicMock, t
 
     train_run.assert_not_called()
     terminator.terminate.assert_not_called()
+
+
+def test_failed_termination_does_not_mask_the_training_error(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock
+) -> None:
+    train_run.side_effect = RuntimeError("boom")
+    terminator.terminate.side_effect = TerminateFailed("DELETE failed with HTTP 500")
+
+    with pytest.raises(RuntimeError, match="boom") as info:
+        run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=terminator, reuse_pilot=False)
+
+    assert any("DELETE failed with HTTP 500" in note for note in info.value.__notes__)
+
+
+def test_failed_pilot_termination_does_not_mask_the_training_error(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock
+) -> None:
+    train_run.side_effect = RuntimeError("boom")
+    terminator.terminate.side_effect = TerminateFailed("DELETE failed with HTTP 500")
+
+    with pytest.raises(RuntimeError, match="boom") as info:
+        sweep_mod.run_pilot(SMALL, tmp_path, DEPS, terminator=terminator)
+
+    assert any("TerminateFailed: DELETE failed with HTTP 500" in note for note in info.value.__notes__)

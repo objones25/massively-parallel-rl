@@ -15,6 +15,7 @@ OPERATING_ERRORS = (
     errors.MissingSecret,
     errors.MeasurementMissing,
     errors.PreflightFailed,
+    errors.InvalidInput,
 )
 
 

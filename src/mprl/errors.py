@@ -41,3 +41,7 @@ class MeasurementMissing(MprlOperatingError):
 
 class PreflightFailed(MprlOperatingError):
     """A setup check found the pod, a service or the volume not ready."""
+
+
+class InvalidInput(MprlOperatingError):
+    """A value the user typed is not acceptable (after any retries)."""

@@ -10,7 +10,8 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import TracebackType
+from typing import TYPE_CHECKING, Literal
 
 from huggingface_hub.errors import HfHubHTTPError
 
@@ -102,3 +103,49 @@ def finish_and_terminate(states: list[RunState], terminator: PodTerminator | Non
         log.info("no pod terminator; leaving the pod running")
         return
     terminator.terminate()
+
+
+class PodGuard:
+    """Terminate the pod when the guarded block exits, however it exits (success, any exception).
+
+    Two exits keep the pod: ``keep(reason)`` was called (the user refused at a prompt), and a
+    ``KeyboardInterrupt`` while ``interactive`` (the user is at the terminal). An error is logged with its
+    traceback before terminating; if termination then fails too, the original exception propagates with
+    the termination failure attached as a note (``add_note``) and logged. ``states`` is what the block
+    trained, for ``finish_and_terminate``'s summary. With ``terminator=None`` only the summary and the
+    flush happen.
+    """
+
+    def __init__(self, terminator: PodTerminator | None, *, interactive: bool) -> None:
+        self.states: list[RunState] = []
+        self._terminator = terminator
+        self._interactive = interactive
+        self._keep_reason = ""
+
+    def keep(self, reason: str) -> None:
+        require(bool(reason), "keeping the pod needs a reason")
+        self._keep_reason = reason
+
+    def __enter__(self) -> PodGuard:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> Literal[False]:
+        if isinstance(exc, KeyboardInterrupt) and self._interactive:
+            log.warning("interrupted at the terminal; leaving the pod running")
+            return False
+        if self._keep_reason:
+            log.info("leaving the pod running: %s", self._keep_reason)
+            return False
+        if exc is not None:
+            log.error("stopping after an error; terminating the pod", exc_info=(exc_type or type(exc), exc, tb))
+        try:
+            finish_and_terminate(self.states, self._terminator)
+        except Exception as error:
+            if exc is None:
+                raise
+            note = f"pod termination also failed: {type(error).__name__}: {error}"
+            log.error(note)
+            exc.add_note(note)
+        return False

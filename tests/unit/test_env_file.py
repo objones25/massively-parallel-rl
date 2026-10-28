@@ -9,6 +9,7 @@ import pytest
 from dotenv import dotenv_values
 
 from mprl.env_file import EnvVar, parse_env_example, prompt_values, render_env, write_env
+from mprl.errors import InvalidInput
 
 EXAMPLE = """\
 # Header block, not attached to any key.
@@ -83,7 +84,7 @@ def test_render_env_preserves_order_and_comments(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("value", ["has space", "a#b", "${HOME}", "quo'te", 'dq"', "back\\slash", "new\nline"])
 def test_render_env_rejects_values_dotenv_would_change(value: str) -> None:
-    with pytest.raises(ValueError, match="HF_TOKEN"):
+    with pytest.raises(InvalidInput, match="HF_TOKEN"):
         render_env(parse_env_example(EXAMPLE), {"HF_TOKEN": value})
 
 
@@ -156,5 +157,5 @@ def test_prompt_values_asks_again_after_an_invalid_value() -> None:
 def test_prompt_values_gives_up_after_three_invalid_values() -> None:
     parsed = [EnvVar("HF_REPO_ID", None, "repo", secret=False)]
 
-    with pytest.raises(ValueError, match="HF_REPO_ID"):
+    with pytest.raises(InvalidInput, match="HF_REPO_ID"):
         prompt_values(parsed, {}, ask=lambda _prompt: "bad value", ask_secret=lambda _prompt: "")
