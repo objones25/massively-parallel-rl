@@ -126,6 +126,12 @@ the handler (`publish.sigterm_raises`, installed only while the command runs) ra
 is saved `failed`, the pod is terminated (unless `--no-terminate`; `results` only with `--terminate`) and the exit
 status is 1. A repeated SIGTERM during that cleanup is ignored. Ctrl-C at a terminal still keeps the pod.
 
+W&B metrics: rsl_rl's own `Loss/*`, `Policy/*`, `Perf/*` every iteration; every `diagnostics_every_k` (10) iterations,
+off the training clock, `mprl.diagnostics` adds `Diag/*`: gradient, weight, update-ratio and activation statistics,
+and the PPO health metrics rsl_rl does not return: `Diag/approx_kl` (k3 estimator), `Diag/clip_fraction` and
+`Diag/explained_variance` (omitted when the returns are constant), over the whole update (rollout policy -> updated
+policy) on at most 16384 strided rollout rows.
+
 ## Where tests run
 
 Tiers are set by directory (`tests/conftest.py`): `tests/unit` is the default fast tier; `tests/smoke`,

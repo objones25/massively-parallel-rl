@@ -85,3 +85,19 @@ def test_policy_scalars_finite_and_aligned_with_rsl_rl_steps(
     assert all(("Diag/obs_norm_mean_abs", s) in by_key and ("Diag/obs_norm_std_mean", s) in by_key for s in (0, 1))
     assert all(math.isfinite(v) for v in by_key.values())
     assert ("Loss/value", 1) in by_key  # same step axis as rsl_rl's own metrics
+
+
+PPO_HEALTH = ("Diag/approx_kl", "Diag/clip_fraction", "Diag/explained_variance")
+
+
+def test_ppo_health_metrics_reach_the_writer_finite_at_every_k_iteration(
+    g1_scalars: tuple[dict[tuple[str, int], float], dict[str, list[str]]],
+) -> None:
+    by_key, _ = g1_scalars
+    steps = (0, 1)  # every_k=1
+
+    assert {(key, s) for key in PPO_HEALTH for s in steps} - set(by_key) == set()
+    assert all(math.isfinite(by_key[(key, s)]) for key in PPO_HEALTH for s in steps)
+    assert all(by_key[("Diag/approx_kl", s)] > 0.0 for s in steps)  # the update moved the policy
+    assert all(0.0 <= by_key[("Diag/clip_fraction", s)] <= 1.0 for s in steps)
+    assert all(by_key[("Diag/explained_variance", s)] <= 1.0 for s in steps)
