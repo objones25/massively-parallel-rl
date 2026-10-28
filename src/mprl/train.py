@@ -21,14 +21,13 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
+import re
 import uuid
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import mjlab.tasks  # noqa: F401  # pyright: ignore[reportUnusedImport]  (registers the tasks)
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -70,20 +69,62 @@ class TrainDeps:
     diagnostics_every_k: int = 10
 
 
+_SHA_RE: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")  # SHA-1 or SHA-256 object names
+_UNKNOWN_SHA: Final = "unknown"
+
+
+def _git_dir(repo: Path) -> Path | None:
+    """``repo/.git``, or the directory a worktree's ``.git`` file points to (``gitdir: <path>``)."""
+    dot_git = repo / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    if not dot_git.is_file():
+        return None
+    line = dot_git.read_text().strip()
+    if not line.startswith("gitdir:"):
+        return None
+    target = Path(line.removeprefix("gitdir:").strip())
+    return target if target.is_absolute() else (repo / target).resolve()
+
+
+def _resolve_ref(git: Path, ref: str) -> str | None:
+    """A ref's SHA from its loose file (which wins, as in git) or ``packed-refs``; refs live in the common dir."""
+    commondir = git / "commondir"
+    common = (git / commondir.read_text().strip()).resolve() if commondir.is_file() else git
+    for base in dict.fromkeys((git, common)):  # a worktree's own dir first, then the shared one
+        loose = base / ref
+        if loose.is_file():
+            return loose.read_text().strip()
+    packed = common / "packed-refs"
+    if packed.is_file():
+        for line in packed.read_text().splitlines():
+            sha, _, name = line.partition(" ")
+            if name.strip() == ref:
+                return sha
+    return None
+
+
 def git_sha(repo: Path = _REPO_DIR) -> str:
-    """HEAD of the repo, or "unknown" when git or the checkout is unavailable (an image without .git)."""
-    git = shutil.which("git")
-    if git is None:
-        log.warning("git not found; recording git_sha=unknown")
-        return "unknown"
+    """HEAD of the checkout at ``repo``, read from ``.git`` (HEAD, then the loose ref or packed-refs).
+
+    No ``git`` process: this runs inside every ``train_run``, and forking from a process holding torch's
+    and wandb's threads can deadlock the child before it execs. "unknown" when there is no checkout (an
+    image without ``.git``) or HEAD does not resolve to a SHA.
+    """
     try:
-        out = subprocess.run(  # noqa: S603  fixed argv, no shell
-            [git, "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, timeout=10, check=True
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        log.warning("git rev-parse failed (%s); recording git_sha=unknown", error)
-        return "unknown"
-    return out.stdout.strip() or "unknown"
+        git = _git_dir(repo)
+        if git is None or not (git / "HEAD").is_file():
+            log.warning("no git checkout at %s; recording git_sha=%s", repo, _UNKNOWN_SHA)
+            return _UNKNOWN_SHA
+        head = (git / "HEAD").read_text().strip()
+        sha = _resolve_ref(git, head.removeprefix("ref:").strip()) if head.startswith("ref:") else head
+    except OSError as error:
+        log.warning("could not read %s/.git (%s); recording git_sha=%s", repo, error, _UNKNOWN_SHA)
+        return _UNKNOWN_SHA
+    if sha is None or _SHA_RE.fullmatch(sha) is None:
+        log.warning("HEAD in %s does not resolve to a SHA (%r); recording git_sha=%s", repo, sha, _UNKNOWN_SHA)
+        return _UNKNOWN_SHA
+    return sha
 
 
 def wandb_logger_cfg(
