@@ -90,6 +90,14 @@ uv run ruff check .                                  # lint (PT, bandit, bugbear
 uv run pyright src                                   # strict on src/mprl; third-party unknown-type reports relaxed (see pyproject)
 ```
 
+Real-pod termination test (`tests/network/test_runpod_terminate.py`, never in CI). Create the cheapest Secure
+Cloud GPU pod yourself in the RunPod console, then run it once. The test deletes that pod and confirms with a read
+that it is gone (404 or `TERMINATED`); it touches no other pod and skips if either variable is missing:
+
+```
+MPRL_THROWAWAY_POD_ID=<pod id> RUNPOD_API_KEY=<key> uv run pytest tests/network/test_runpod_terminate.py -m network
+```
+
 Setup script, train script and the `mprl` CLI are not written yet; document them here when they exist.
 
 ## Where tests run
