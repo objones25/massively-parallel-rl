@@ -43,8 +43,12 @@ def make_env_runner(
     play: bool = False,
     num_envs: int = NUM_ENVS,
     render_mode: str | None = None,
+    configure_env: Callable[[Any], None] | None = None,
 ) -> tuple[Any, Any]:
-    """(env, runner) for the shipped G1 config, seeded with its own seed (as mjlab's train script)."""
+    """(env, runner) for the shipped G1 config, seeded with its own seed (as mjlab's train script).
+
+    ``configure_env`` edits the env config in place before the env is built (a test's one deliberate change).
+    """
     import mjlab.tasks  # noqa: F401  (registers the tasks)
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.rl import RslRlVecEnvWrapper
@@ -57,6 +61,8 @@ def make_env_runner(
     env_cfg.scene.num_envs = num_envs
     rl_cfg = load_rl_cfg(TASK_ID)
     env_cfg.seed = rl_cfg.seed
+    if configure_env is not None:
+        configure_env(env_cfg)
     env = ManagerBasedRlEnv(cfg=env_cfg, device="cpu", render_mode=render_mode)
     agent_cfg = asdict(rl_cfg)
     agent_cfg["logger"] = logger

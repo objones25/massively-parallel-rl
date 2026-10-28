@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import mprl.cli as cli
+import mprl.throughput as throughput_mod
 from mprl.budget import load_measurements
+from mprl.checkpoints import CheckpointRef
+from mprl.evaluator import EvalConfig
+from mprl.throughput import CountMeasurement
 
 pytestmark = pytest.mark.smoke
 
@@ -88,12 +93,32 @@ def test_throughput_writes_measurements_with_timed_eval(tmp_path: Path, monkeypa
     monkeypatch.setenv("MPRL_VOLUME_ROOT", str(root))
     monkeypatch.setenv("MPRL_ENV_FILE", str(tmp_path / "no.env"))
     (root / "throughput" / "stale").mkdir(parents=True)
+    measured: list[CountMeasurement] = []
+    evaluated: list[tuple[CheckpointRef, EvalConfig, float]] = []  # (checkpoint, config, inner wall seconds)
+    real_measure, real_evaluate = throughput_mod.measure_count, throughput_mod.evaluate_checkpoint
+
+    def measure_count(*args: Any, **kwargs: Any) -> CountMeasurement:
+        measured.append(real_measure(*args, **kwargs))
+        return measured[-1]
+
+    def evaluate_checkpoint(run_id: str, ref: CheckpointRef, cfg: EvalConfig, device: str) -> Any:
+        start = time.perf_counter()
+        result = real_evaluate(run_id, ref, cfg, device)
+        evaluated.append((ref, cfg, time.perf_counter() - start))
+        return result
+
+    monkeypatch.setattr(throughput_mod, "measure_count", measure_count)
+    monkeypatch.setattr(throughput_mod, "evaluate_checkpoint", evaluate_checkpoint)
 
     code = cli.main(["throughput", "--counts", "4", "--iterations", "2", "--device", "cpu"])
 
     assert code == 0
     m = load_measurements(root / "measurements.json")
     assert m.fits == {4: True}
-    assert m.steps_per_second[4] > 0
-    assert m.eval_seconds_per_checkpoint > 0
+    assert m.steps_per_second == {4: measured[0].steps_per_second}  # what the real training run measured
+    (ref, cfg, inner_s) = evaluated[0]
+    assert len(evaluated) == 1
+    assert ref.path.parent == root / "throughput" / "n00004" / "checkpoints"  # the throughput run's own checkpoint
+    assert cfg == EvalConfig()  # the config `mprl results` evaluates with
+    assert m.eval_seconds_per_checkpoint >= inner_s  # the timed span encloses the whole evaluation
     assert not (root / "throughput" / "stale").exists()

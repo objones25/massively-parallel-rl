@@ -234,7 +234,10 @@ def test_failed_upload_of_real_run_files_is_durable_before_terminate(
 
     final = expect(CheckpointStore(paths.checkpoints_dir).latest(), "no checkpoint")
     path_in_repo = f"runs/main/{spec.run_id}"
-    assert events[0] == ("upload", sorted({final.path.name, "checkpoints.onnx", "env.yaml", "agent.yaml", "state.json"}))
+    assert events[0] == (
+        "upload",
+        sorted({final.path.name, "checkpoints.onnx", "env.yaml", "agent.yaml", "state.json"}),
+    )
     assert [name for name, _ in events] == ["upload", "DELETE"]
     assert state.uploads[path_in_repo].startswith("UploadFailed:")
     assert events[-1][1] == state.uploads  # the failure was durable on disk before the DELETE
@@ -266,3 +269,27 @@ def test_only_num_envs_and_seed_differ_between_sweep_runs() -> None:
     }
     assert _diff(a, b) == {"env.scene.num_envs", "env.seed", "agent.seed", "agent.logger.run_id"} | derived
     assert json.dumps(a["agent"]["logger"]["extra_config"])  # serializable for wandb.config
+
+
+SECRETS = {
+    "WANDB_API_KEY": "SENTINEL-wandb-3f9a1c7e5b",
+    "HF_TOKEN": "hf_SENTINEL-hf-8d2e6a4c0f",
+    "RUNPOD_API_KEY": "rpa_SENTINEL-rp",
+}
+
+
+def test_wandb_run_config_never_contains_secrets() -> None:
+    """Everything the W&B writer is configured with (extra_config) and stores (train_cfg, env_cfg), from a full environ."""
+    spec = RunSpec("main", 64, 0, 45.0)
+    environ = {**SECRETS, "WANDB_PROJECT": "proj", "WANDB_ENTITY": "team", "MPRL_IMAGE_DIGEST": "sha256:" + "d" * 64}
+
+    logger = wandb_logger_cfg(spec, "rid", None, "offline", git_sha="c" * 40, environ=environ)
+    env_cfg, agent_cfg = resolve_cfgs(spec, logger)
+
+    stored = repr({"env": asdict(env_cfg), "agent": agent_cfg})
+    assert (logger["project"], logger["entity"], logger["extra_config"]["image_digest"]) == (
+        "proj",
+        "team",
+        environ["MPRL_IMAGE_DIGEST"],
+    )  # control: the environ was read
+    assert [name for name, value in SECRETS.items() if value in stored] == []

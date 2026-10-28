@@ -36,14 +36,15 @@ SAVE_BUSY_S = 0.3  # off-clock work per checkpoint write
 
 
 class RecordingWriter(LogWriter):
-    """A real rsl_rl LogWriter that records every model upload request."""
+    """A real rsl_rl LogWriter that records every scalar's (tag, step) and every model upload request."""
 
     def __init__(self, log_dir: str) -> None:
         self.log_dir = log_dir
         self.saved_models: list[tuple[str, int]] = []
+        self.scalars: list[tuple[str, int]] = []
 
-    def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
-        pass
+    def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:  # noqa: ARG002  LogWriter API
+        self.scalars.append((tag, global_step))
 
     def save_model(self, model_path: str, it: int) -> None:
         self.saved_models.append((model_path, it))
@@ -70,6 +71,23 @@ class RecordedRun:
     store_files: set[str]
     store_dir: Path
     uploads_requested: list[tuple[str, int]]
+    iteration_ends: list[float]  # the clock at the end of every iteration (on_iteration)
+    scalars: list[tuple[str, int]]  # every (tag, step) rsl_rl's logger wrote
+
+
+BUDGET_S = 4.0
+EVERY_S = 1.0
+
+
+def _expected_saves(iteration_ends: list[float]) -> list[float]:
+    """Clock values at which a checkpoint is due: the first iteration end past each whole EVERY_S mark, and the last."""
+    saves: list[float] = []
+    last = 0.0
+    for t in iteration_ends:
+        if math.floor(t / EVERY_S) > math.floor(last / EVERY_S) or t == iteration_ends[-1]:
+            saves.append(t)
+            last = t
+    return saves
 
 
 @pytest.fixture(scope="module")
@@ -81,9 +99,12 @@ def recorded_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RecordedR
         store = CheckpointStore(root / "checkpoints")
         clock = TrainingClock(sync=cuda_sync_for("cpu"))
         saved_at: list[tuple[CheckpointRef, float]] = []
+        ends: list[float] = []
         result = runner.learn_for(
-            clock, 4.0, 1.0, store, fresh_start=True, on_checkpoint=lambda ref: saved_at.append((ref, clock.elapsed_s))
-        )
+            clock, BUDGET_S, EVERY_S, store, fresh_start=True,
+            on_checkpoint=lambda ref: saved_at.append((ref, clock.elapsed_s)),
+            on_iteration=lambda _it: ends.append(clock.elapsed_s),
+        )  # fmt: skip
         writer = runner.logger.writer
         assert isinstance(writer, RecordingWriter)
         yield RecordedRun(
@@ -94,6 +115,8 @@ def recorded_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RecordedR
             {p.name for p in (root / "checkpoints").iterdir()},
             root / "checkpoints",
             list(writer.saved_models),
+            ends,
+            list(writer.scalars),
         )
     finally:
         env.close()
@@ -102,11 +125,13 @@ def recorded_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RecordedR
 def test_learn_for_stops_when_budget_reached(recorded_run: RecordedRun) -> None:
     result = recorded_run.result
 
+    ends = recorded_run.iteration_ends
+
     assert result.budget_exhausted
-    assert recorded_run.elapsed_s >= 4.0
-    assert result.overshoot_s == pytest.approx(recorded_run.elapsed_s - 4.0)
-    assert 0.0 <= result.overshoot_s < 2.0  # stops after the iteration that crossed the budget
-    assert result.iterations_run >= 2
+    assert result.iterations_run == len(ends)
+    assert ends[-1] == recorded_run.elapsed_s
+    assert ends[-2] < BUDGET_S <= ends[-1]  # stops after exactly the iteration that crossed the budget
+    assert result.overshoot_s == pytest.approx(recorded_run.elapsed_s - BUDGET_S)
     assert recorded_run.stored[-1] == result.final
 
 
@@ -125,15 +150,11 @@ def test_checkpoints_follow_training_clock(recorded_run: RecordedRun) -> None:
     saved_at = recorded_run.saved_at
 
     times = [t for _, t in saved_at]
-    windows = [math.floor(t) for t in times]
-    gaps = [b - a for a, b in itertools.pairwise(times)]
     assert [ref for ref, _ in saved_at] == recorded_run.stored
     assert saved_at[-1][0] == recorded_run.result.final
-    assert len(saved_at) >= 3
-    assert times[0] >= 1.0  # nothing saved before the first 1 s mark
-    assert windows == sorted(set(windows))  # one checkpoint per crossed 1 s mark, never two
-    assert all(0.0 < g < 2.0 for g in gaps), gaps  # about 1 s apart on the training clock
-    assert times[-1] >= 4.0
+    # Exactly the iteration ends that first cross each 1 s mark of the training clock, plus the last one.
+    assert times == _expected_saves(recorded_run.iteration_ends)
+    assert times[0] >= EVERY_S  # nothing saved before the first mark
     assert [ref.train_seconds for ref, _ in saved_at] == [float(round(t)) for t in times]
 
 
@@ -281,3 +302,79 @@ def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, sto
     assert result.final.iteration == resumed.current_learning_iteration
     assert clock.elapsed_s >= restored_s + 1.5
     assert torch.load(result.final.path, weights_only=False)["infos"]["clock"] == {"elapsed_s": clock.elapsed_s}
+
+
+STEP_COST_S = 1.0  # fake seconds each env.step takes
+UPDATE_COST_S = 1000.0  # fake seconds each alg.update takes
+SPLIT_ITERATIONS = 2
+
+
+@pytest.fixture(scope="module")
+def split_clock(tmp_path_factory: pytest.TempPathFactory) -> Iterator[list[tuple[str, float]]]:
+    """One 2-iteration learn_for on a fake time source that only env.step and alg.update advance.
+
+    Yields the clock at each hook: ``before_update`` (after the rollout measure) and ``iteration`` (after the
+    update measure), so the rollout's and the update's share of the clock can be read separately and exactly.
+    """
+    root = tmp_path_factory.mktemp("split")
+    env, runner = make_env_runner(root / "logs")
+    try:
+        fake_now = [0.0]
+        real_step, real_update = runner.env.step, runner.alg.update
+
+        def step(actions: torch.Tensor) -> Any:
+            fake_now[0] += STEP_COST_S
+            return real_step(actions)
+
+        def update() -> Any:
+            fake_now[0] += UPDATE_COST_S
+            return real_update()
+
+        runner.env.step, runner.alg.update = step, update
+        clock = TrainingClock(now=lambda: fake_now[0])
+        marks: list[tuple[str, float]] = []
+        runner.learn_for(
+            clock, 1e9, 1e9, CheckpointStore(root / "checkpoints"), fresh_start=True, max_iterations=SPLIT_ITERATIONS,
+            on_before_update=lambda _it: marks.append(("before_update", clock.elapsed_s)),
+            on_iteration=lambda _it: marks.append(("iteration", clock.elapsed_s)),
+        )  # fmt: skip
+        yield marks
+    finally:
+        env.close()
+
+
+def test_clock_counts_every_rollout_env_step(split_clock: list[tuple[str, float]]) -> None:
+    previous = [0.0, *[t for name, t in split_clock if name == "iteration"][:-1]]
+    after_rollout = [t for name, t in split_clock if name == "before_update"]
+
+    rollout_s = [b - a for a, b in zip(previous, after_rollout, strict=True)]
+
+    assert rollout_s == [STEPS_PER_ITERATION * STEP_COST_S] * SPLIT_ITERATIONS
+
+
+def test_clock_counts_every_ppo_update(split_clock: list[tuple[str, float]]) -> None:
+    after_rollout = [t for name, t in split_clock if name == "before_update"]
+    after_update = [t for name, t in split_clock if name == "iteration"]
+
+    update_s = [b - a for a, b in zip(after_rollout, after_update, strict=True)]
+
+    assert update_s == [UPDATE_COST_S] * SPLIT_ITERATIONS
+
+
+RSL_RL_METRICS = (
+    "Loss/value",
+    "Loss/surrogate",
+    "Loss/entropy",
+    "Loss/learning_rate",
+    "Policy/mean_std",
+    "Perf/total_fps",
+    "Perf/collection_time",
+    "Perf/learning_time",
+)
+
+
+def test_rsl_rl_metrics_reach_the_writer_every_iteration(recorded_run: RecordedRun) -> None:
+    """learn_for's logger.log writes rsl_rl's losses, learning rate, policy std and throughput at every step."""
+    expected = {(tag, it) for tag in RSL_RL_METRICS for it in range(recorded_run.result.iterations_run)}
+
+    assert expected - set(recorded_run.scalars) == set()
