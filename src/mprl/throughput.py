@@ -17,8 +17,10 @@ A count whose run raises the CUDA ``torch.OutOfMemoryError`` (verified in torch 
 ``torch.cuda.OutOfMemoryError is torch.OutOfMemoryError``, a ``RuntimeError`` subclass) is recorded
 as ``fits[n] = False`` and the test continues; every other error propagates.
 
-``eval_seconds_per_checkpoint`` is not measured here: offline evaluation (Task 11) does not exist
-yet, so the caller passes it explicitly (measured by the evaluator, or 0 for the training-only cost).
+``measure_throughput`` takes ``eval_seconds_per_checkpoint`` from the caller; ``measure_eval_seconds``
+measures it as the wall time of one ``evaluate_checkpoint`` on a count's throughput checkpoint (env
+build included, as ``mprl.results`` builds one env per checkpoint; Warp kernels compiled on first use
+are included too, so it errs high).
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ from mprl.budget import Measurements
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import RunSpec
-from mprl.negative_space import check_finite, require
+from mprl.evaluator import EvalConfig, evaluate_checkpoint
+from mprl.negative_space import check_finite, expect, require
 from mprl.train import TrainDeps, built_runner
 
 if TYPE_CHECKING:
@@ -114,6 +117,22 @@ def measure_count(
     return CountMeasurement(sps, per_iteration + save)
 
 
+def count_dir(work_dir: Path, num_envs: int) -> Path:
+    """Scratch dir of one count's measurement; its final checkpoint is under ``checkpoints/``."""
+    return work_dir / f"n{num_envs:05d}"
+
+
+def measure_eval_seconds(work_dir: Path, num_envs: int, device: str, cfg: EvalConfig) -> float:
+    """Wall seconds of one ``evaluate_checkpoint`` with ``cfg`` on ``num_envs``'s throughput checkpoint."""
+    ref = expect(
+        CheckpointStore(count_dir(work_dir, num_envs) / "checkpoints").latest(),
+        f"no throughput checkpoint for num_envs={num_envs} under {work_dir}",
+    )
+    start = time.perf_counter()
+    evaluate_checkpoint(_SWEEP, ref, cfg, device)
+    return time.perf_counter() - start
+
+
 def _release_device_memory(device: str) -> None:
     gc.collect()
     if device.startswith("cuda"):
@@ -138,7 +157,7 @@ def measure_throughput(
     for n in env_counts:
         measured: CountMeasurement | None = None
         try:
-            measured = measure_count(n, iterations, device, work_dir / f"n{n:05d}", checkpoint_every_minutes)
+            measured = measure_count(n, iterations, device, count_dir(work_dir, n), checkpoint_every_minutes)
         except torch.OutOfMemoryError as error:
             # Log the text, not the exception: a handler that keeps LogRecords would keep its traceback.
             log.warning("num_envs=%d does not fit on %s: %s", n, device, str(error))

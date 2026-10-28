@@ -14,7 +14,8 @@ import pytest
 import torch
 
 import mprl.throughput as throughput_mod
-from mprl.throughput import measure_throughput
+from mprl.evaluator import EvalConfig
+from mprl.throughput import measure_eval_seconds, measure_throughput
 
 pytestmark = pytest.mark.smoke
 
@@ -74,3 +75,16 @@ def test_memory_released_after_oom_frame_is_gone(tmp_path: Path, monkeypatch: py
 
     assert m.fits == {4: False, 8: False}
     assert alive_at_release == [False, False]
+
+
+def test_eval_seconds_timed_on_a_throughput_checkpoint(tmp_path: Path) -> None:
+    measure_throughput((4,), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
+
+    seconds = measure_eval_seconds(tmp_path, 4, "cpu", EvalConfig(envs_per_command=1, seeds=(0,), horizon_s=0.1))
+
+    assert 0.0 < seconds < 600.0
+
+
+def test_eval_seconds_needs_a_checkpoint(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="no throughput checkpoint"):
+        measure_eval_seconds(tmp_path, 4, "cpu", EvalConfig())

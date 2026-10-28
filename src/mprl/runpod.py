@@ -14,7 +14,7 @@ from typing import Final
 
 import httpx
 
-from mprl.errors import OwnPodUnknown, TerminateFailed
+from mprl.errors import MissingSecret, OwnPodUnknown, TerminateFailed
 from mprl.negative_space import bounded, require
 
 # Verified 2026-10-27 against RunPod's REST v2 docs:
@@ -27,6 +27,7 @@ from mprl.negative_space import bounded, require
 RUNPOD_REST_BASE: Final[str] = "https://api.runpod.io/v2"
 
 _POD_ID_VAR = "RUNPOD_POD_ID"
+_API_KEY_VAR = "RUNPOD_API_KEY"
 _POD_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _OK = 200
 _NO_CONTENT = 204
@@ -56,6 +57,21 @@ def own_pod_id(environ: Mapping[str, str], proc1_environ: Path = Path("/proc/1/e
     raise OwnPodUnknown(f"{_POD_ID_VAR} is not set in the environment or in {proc1_environ}")
 
 
+def own_terminator(environ: Mapping[str, str], client: httpx.Client) -> PodTerminator:
+    """A ``PodTerminator`` for the pod we run on; ``MissingSecret`` / ``OwnPodUnknown`` when it cannot be built.
+
+    The pod id comes from outside the program, so a malformed one is an operating error here rather than
+    the constructor's contract violation.
+    """
+    api_key = environ.get(_API_KEY_VAR)
+    if not api_key:
+        raise MissingSecret(f"{_API_KEY_VAR} is not set")
+    pod_id = own_pod_id(environ)
+    if _POD_ID_PATTERN.fullmatch(pod_id) is None:
+        raise OwnPodUnknown(f"malformed pod id {pod_id!r}: expected [A-Za-z0-9_-]+")
+    return PodTerminator(client, api_key, pod_id, base_url=RUNPOD_REST_BASE)
+
+
 class PodTerminator:
     def __init__(
         self,
@@ -79,6 +95,14 @@ class PodTerminator:
         self._max_attempts = max_attempts
         self._base_delay_s = base_delay_s
         self._sleep = sleep
+
+    @property
+    def pod_id(self) -> str:
+        return self._pod_id
+
+    def status(self) -> str | None:
+        """The pod's status (GET, retrying transient failures), or None when it does not exist (404)."""
+        return self._read_status()
 
     def terminate(self) -> None:
         """Read the pod, delete it, then confirm with a read that it is gone (404 or status TERMINATED).

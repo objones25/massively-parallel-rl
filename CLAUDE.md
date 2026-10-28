@@ -98,7 +98,24 @@ that it is gone (404 or `TERMINATED`); it touches no other pod and skips if eith
 MPRL_THROWAWAY_POD_ID=<pod id> RUNPOD_API_KEY=<key> uv run pytest tests/network/test_runpod_terminate.py -m network
 ```
 
-Setup script, train script and the `mprl` CLI are not written yet; document them here when they exist.
+On the pod (repo cloned to `/workspace/massively-parallel-rl`, so `.env` persists on the volume). `.env` lives in the
+repo root (gitignored, mode 0600); the CLI loads it at startup without overriding variables already set.
+
+```
+scripts/setup.sh                                     # refuses unless /workspace is mounted; uv sync; prompts keys -> .env; preflight
+scripts/setup.sh --allow-no-volume --cpu             # local testing: no mount check, no CUDA/RunPod checks
+scripts/train.sh                                     # = mprl sweep --name main
+scripts/train.sh preflight [--cpu] [--only env volume ...]           # PASS/FAIL per check; exit 1 on any FAIL
+scripts/train.sh throughput --counts 64 256 1024 4096 16384          # writes $MPRL_VOLUME_ROOT/measurements.json
+scripts/train.sh pilot                                               # long run's first 45 min, then terminates the pod
+scripts/train.sh sweep --name main --reuse-pilot [--yes]             # --yes accepts budget cuts unattended
+scripts/train.sh train-run --sweep dbg --num-envs 64 --seed 0 --minutes 3 --no-terminate
+scripts/train.sh results --name main --primary-metric vel_error_xy   # off the clock; --terminate to delete the pod after
+```
+
+`train-run`, `pilot` and `sweep` resolve the pod id and build the terminator before training, and refuse
+without `RUNPOD_API_KEY` or a pod id unless `--no-terminate` is given. All take `--device` (default `cuda:0`
+when available) and `--wandb-mode online|offline|disabled`.
 
 ## Where tests run
 
