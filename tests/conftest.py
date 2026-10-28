@@ -16,16 +16,15 @@ import importlib.util
 import ipaddress
 import os
 import random
-import signal
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 import pytest
-from support import APP_ENV_PREFIXES, DEFAULT_MARKEXPR
+from support import APP_ENV_PREFIXES, DEFAULT_MARKEXPR, Subprocesses
 
 # One fixed seed for the whole suite. Any value works; it must never change.
 SEED = 20260826
@@ -170,63 +169,29 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------
 # Subprocesses
 # --------------------------------------------------------------------------
-KILL_WAIT_S = 10.0  # after SIGKILL to the group, the reap itself is bounded too
-
-
-class Subprocesses:
-    """The only way tests start a process: its own session, no stdin, bounded waits, group killed after.
-
-    ``start_new_session=True`` makes the child the leader of a new process group, so ``os.killpg`` reaches
-    everything it started (uv's python, ffmpeg); ``stdin=DEVNULL`` means nothing can block reading the
-    terminal. Every process still alive at teardown has its group SIGKILLed and is reaped.
-    """
-
-    def __init__(self) -> None:
-        self._started: list[subprocess.Popen[Any]] = []
-
-    def spawn(self, argv: Sequence[str], *, env: dict[str, str], stdout: IO[Any] | int) -> subprocess.Popen[Any]:
-        child = subprocess.Popen(  # noqa: S603  argv is built by the test, never from input
-            list(argv), env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )  # fmt: skip
-        self._started.append(child)
-        return child
-
-    def run(self, argv: Sequence[str], *, env: dict[str, str], timeout_s: float) -> subprocess.CompletedProcess[str]:
-        child = subprocess.Popen(  # noqa: S603  argv is built by the test, never from input
-            list(argv), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
-        )  # fmt: skip
-        self._started.append(child)
-        try:
-            out, err = child.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            self.kill_group(child)
-            raise
-        return subprocess.CompletedProcess(list(argv), child.returncode, out, err)
-
-    @staticmethod
-    def kill_group(child: subprocess.Popen[Any]) -> None:
-        """SIGKILL the child's whole process group, then reap the child (bounded)."""
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:  # the group is already gone
-            pass
-        child.communicate(timeout=KILL_WAIT_S)
-
-    def close(self) -> None:
-        for child in self._started:
-            if child.poll() is None:
-                self.kill_group(child)
-
-
 @pytest.fixture
 def subprocesses() -> Iterator[Subprocesses]:
+    """The only way a test starts a process (``support.Subprocesses``); survivors are killed at teardown."""
     procs = Subprocesses()
     try:
         yield procs
     finally:
         procs.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_subprocesses_in_the_fast_tier(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fast-tier test that starts any process (ffmpeg, git, python) fails; heavy tiers may.
+
+    Blocks ``subprocess.Popen._execute_child``, which every ``subprocess`` launch goes through.
+    """
+    if any(request.node.get_closest_marker(name) for name in DIRECTORY_MARKERS):
+        return
+
+    def blocked(self: subprocess.Popen[Any], args: object, *rest: object, **kwargs: object) -> None:
+        raise AssertionError(f"fast-tier test started a process {args!r}; move it to tests/smoke")
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", blocked)
 
 
 # --------------------------------------------------------------------------

@@ -80,10 +80,12 @@ uv sync                                              # install (also installs th
 uv run pytest                                        # fast tier only (~10 s): no mjlab import, no training, no coverage
 uv run pytest tests/unit/test_clock.py::test_name -v # one test
 uv run pytest -m smoke -p no:randomly                # heavy tier (~2 min CPU): real mjlab/rsl_rl, training, W&B offline, ffmpeg
+uv run pytest -m smoke tests/smoke/test_render.py::test_render_rollout_cpu   # one smoke test: still needs -m smoke
 uv run pytest -m network                             # real W&B / HF / RunPod (needs keys in the environment)
 uv run pytest -m gpu                                 # CUDA tests (on the pod; skip cleanly without CUDA)
 uv run pytest -p randomly -n auto                    # random order, parallel
 uv run pytest -m "not network and not gpu" --cov --cov-branch --cov-report=xml --cov-fail-under=80   # CI: fast + smoke, coverage floor
+# (the 80 % floor is for that fast + smoke run; bare `pytest --cov` on the fast tier alone falls below it)
 uv tool run --from shellcheck-py shellcheck scripts/*.sh                                             # lint the bash scripts
 
 uv run python scripts/audit_tests.py tests/          # must print "clean: no findings"
@@ -124,8 +126,9 @@ when available) and `--wandb-mode online|offline|disabled`.
 Tiers are set by directory (`tests/conftest.py`): `tests/unit` is the default fast tier; `tests/smoke`,
 `tests/network` and `tests/gpu` are marked by name and deselected by default (under the default `-m` they are not
 even collected, so the fast tier never imports mjlab; `tests/unit/test_tiers.py` pins that). pytest-timeout: 60 s
-per fast test, 600 s per heavy test; the faulthandler exits after 900 s. Tests start processes only through the
-`subprocesses` fixture (own session, no stdin, bounded wait, group SIGKILLed on timeout/teardown). The smoke tier
+per fast test, 600 s per heavy test; the faulthandler exits after 900 s. Fast-tier tests may not start any process
+(an autouse guard fails them); heavy tests start processes only through the `subprocesses` fixture
+(`support.Subprocesses`: posix_spawn-compatible launch, no stdin, bounded waits, terminate then kill on timeout). The smoke tier
 trains for real only where training is the behavior; inputs come from two session fixtures in
 `tests/smoke/conftest.py` (`g1_checkpoint`, `completed_run_template`), copied before any mutation. Shared helpers
 live in `tests/support.py` (`tests` is on pytest's pythonpath).

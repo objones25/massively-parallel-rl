@@ -110,6 +110,17 @@ def test_learn_for_stops_when_budget_reached(recorded_run: RecordedRun) -> None:
     assert recorded_run.stored[-1] == result.final
 
 
+def test_budget_stop_saves_the_final_checkpoint_off_cadence(build: Build, store: CheckpointStore) -> None:
+    """With no checkpoint mark ever due, the iteration that crosses the budget still saves the one checkpoint."""
+    _, runner = build()
+
+    result = runner.learn_for(TrainingClock(sync=cuda_sync_for("cpu")), 3.0, LONG_S, store, fresh_start=True)
+
+    assert result.budget_exhausted
+    assert store.list() == [result.final]
+    assert result.final.iteration == runner.current_learning_iteration
+
+
 def test_checkpoints_follow_training_clock(recorded_run: RecordedRun) -> None:
     saved_at = recorded_run.saved_at
 

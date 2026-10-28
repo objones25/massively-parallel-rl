@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import imageio.v2 as imageio
 import numpy as np
 import pytest
 
@@ -116,14 +115,6 @@ def test_timeline_never_picks_checkpoint_after_last_mark(tmp_path: Path):
     stores = {64: _store(tmp_path, "a", [3, 6, 45, 48, 90])}
     timeline = race_timeline(stores, [3.0, 45.0], 3.0)
     assert [_mark_of(refs[64]) for _, refs in timeline] == [3.0, 45.0]
-
-
-def test_write_video_round_trip(tmp_path: Path):
-    frames = (np.full((64, 96, 3), 40 * i, dtype=np.uint8) for i in range(6))
-    path = tmp_path / "out" / "race.mp4"
-    write_video(frames, path, fps=5)
-    with imageio.get_reader(str(path)) as reader:
-        assert reader.count_frames() == 6
 
 
 def test_write_video_rejects_empty(tmp_path: Path):

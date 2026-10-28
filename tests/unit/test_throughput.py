@@ -12,6 +12,7 @@ from __future__ import annotations
 import weakref
 from pathlib import Path
 from typing import Any
+from unittest.mock import create_autospec
 
 import pytest
 import torch
@@ -29,13 +30,12 @@ def test_oom_count_recorded_not_raised(tmp_path: Path, monkeypatch: pytest.Monke
         raise torch.OutOfMemoryError(f"CUDA out of memory at num_envs={num_envs}. Tried to allocate 2.00 GiB")
 
     behaviors = iter([fits, oom])  # a measurement for 4, OOM for 8
-    seen: list[int] = []
 
     def measure(num_envs: int, *args: Any, **kwargs: Any) -> CountMeasurement:
-        seen.append(num_envs)
         return next(behaviors)(num_envs, *args, **kwargs)
 
-    monkeypatch.setattr(throughput_mod, "measure_count", measure)
+    double = create_autospec(throughput_mod.measure_count, side_effect=measure)
+    monkeypatch.setattr(throughput_mod, "measure_count", double)
 
     m = measure_throughput((4, 8), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=1.5)
 
@@ -43,14 +43,15 @@ def test_oom_count_recorded_not_raised(tmp_path: Path, monkeypatch: pytest.Monke
     assert m.steps_per_second == {4: pytest.approx(1234.0)}
     assert m.io_overhead_fraction == pytest.approx(0.05)
     assert m.eval_seconds_per_checkpoint == pytest.approx(1.5)
-    assert seen == [4, 8]
+    assert [c.args[0] for c in double.call_args_list] == [4, 8]
+    assert double.call_args.args[3] == tmp_path / "n00008"  # each count in its own scratch dir
 
 
 def test_non_oom_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def broken(num_envs: int, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("not an allocation failure")
 
-    monkeypatch.setattr(throughput_mod, "measure_count", broken)
+    monkeypatch.setattr(throughput_mod, "measure_count", create_autospec(throughput_mod.measure_count, side_effect=broken))
 
     with pytest.raises(RuntimeError, match="not an allocation failure"):
         measure_throughput((4,), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
@@ -69,7 +70,7 @@ def test_memory_released_after_oom_frame_is_gone(tmp_path: Path, monkeypatch: py
         refs.append(weakref.ref(payload))
         raise torch.OutOfMemoryError(f"CUDA out of memory at num_envs={num_envs}")
 
-    monkeypatch.setattr(throughput_mod, "measure_count", oom)
+    monkeypatch.setattr(throughput_mod, "measure_count", create_autospec(throughput_mod.measure_count, side_effect=oom))
     monkeypatch.setattr(
         throughput_mod, "_release_device_memory", lambda _device: alive_at_release.append(refs[-1]() is not None)
     )

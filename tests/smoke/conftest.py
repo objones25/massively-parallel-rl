@@ -11,6 +11,7 @@ read one of two session artifacts, built once and never mutated (copy before cha
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 from collections.abc import Callable, Iterator
@@ -91,6 +92,6 @@ def completed_run_template(tmp_path_factory: pytest.TempPathFactory) -> Complete
 
 @pytest.fixture
 def completed_run(completed_run_template: CompletedRun, tmp_path: Path) -> CompletedRun:
-    """A private copy of the completed run's volume (W&B dir not copied), safe to resume or mutate."""
+    """Private copies of the completed run's volume and RunState (W&B dir not copied), safe to resume or mutate."""
     volume = Path(shutil.copytree(completed_run_template.volume, tmp_path / "volume"))
-    return CompletedRun(volume, completed_run_template.wandb_dir, completed_run_template.state)
+    return CompletedRun(volume, completed_run_template.wandb_dir, copy.deepcopy(completed_run_template.state))

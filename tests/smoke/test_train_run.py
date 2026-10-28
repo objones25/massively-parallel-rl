@@ -152,7 +152,8 @@ def test_resume_after_kill_continues_clock(tmp_path: Path, subprocesses: Any) ->
         try:
             _wait_for_first_checkpoint(child, store)
         finally:
-            subprocesses.kill_group(child)  # SIGKILL: no handler, no cleanup, like a pod losing power
+            child.kill()  # SIGKILL: no handler, no cleanup, like a pod losing power (W&B is off: no grandchild)
+            child.wait(timeout=30)
     killed_at = expect(store.latest(), f"no checkpoint within {KILL_DEADLINE_S} s; see {tmp_path / 'child.log'}")
     stored = expect(load_state(paths.state_file), "the child wrote no state.json")
     assert stored.status == "running"

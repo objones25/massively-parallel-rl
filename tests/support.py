@@ -5,9 +5,11 @@ Only constants, plain functions and types live here; fixtures stay in the confte
 
 from __future__ import annotations
 
+import subprocess
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import httpx
 
@@ -87,3 +89,61 @@ def runpod_terminator(paths: RunPaths, events: list[tuple[str, object]]) -> PodT
 
     client = httpx.Client(transport=httpx.MockTransport(handle))
     return PodTerminator(client, "key", POD, base_url="https://api.test/v2")
+
+
+TERMINATE_WAIT_S = 10.0  # after terminate(), before kill()
+KILL_WAIT_S = 10.0  # after kill(), the reap itself is bounded too
+
+
+class Subprocesses:
+    """Launch processes from a test on CPython's ``posix_spawn`` path; bounded waits; survivors are killed.
+
+    ``posix_spawn`` (CPython 3.12 ``Popen._execute_child``) needs: an executable with a directory part,
+    ``close_fds=False`` (pipes are non-inheritable anyway, PEP 446), no ``cwd``, no ``start_new_session`` /
+    ``process_group`` / ``preexec_fn`` / ``pass_fds`` / uid / gid / umask. Anything else makes CPython
+    ``fork()`` the multithreaded pytest process, and the child can deadlock before exec.
+    ``tests/unit/test_subprocesses.py`` pins these keyword arguments.
+
+    A child is tracked from the moment ``Popen`` returns. If ``Popen`` itself raises, no child is left to
+    track: CPython reports the spawn failure only after the child is gone, so the error simply propagates.
+    """
+
+    def __init__(self, popen: Callable[..., Any] = subprocess.Popen) -> None:
+        self._popen = popen
+        self._started: list[Any] = []
+
+    def _launch(self, argv: Sequence[str], **kwargs: Any) -> Any:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError(f"executable must be an absolute path (posix_spawn needs a directory part): {argv[0]!r}")
+        child = self._popen(list(argv), stdin=subprocess.DEVNULL, close_fds=False, **kwargs)
+        self._started.append(child)
+        return child
+
+    def spawn(self, argv: Sequence[str], *, env: dict[str, str], stdout: IO[Any] | int) -> Any:
+        """Start ``argv`` with stdout (and stderr) to ``stdout``; the caller waits, ``close`` cleans up."""
+        return self._launch(argv, env=env, stdout=stdout, stderr=subprocess.STDOUT)
+
+    def run(self, argv: Sequence[str], *, env: dict[str, str], timeout_s: float) -> subprocess.CompletedProcess[str]:
+        """Run ``argv`` to completion within ``timeout_s``; on timeout stop it (``stop``) and re-raise."""
+        child = self._launch(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = child.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            self.stop(child)
+            raise
+        return subprocess.CompletedProcess(list(argv), child.returncode, out, err)
+
+    @staticmethod
+    def stop(child: Any) -> None:
+        """``terminate()``, then ``kill()`` if it is still running after TERMINATE_WAIT_S; reap it (bounded)."""
+        child.terminate()
+        try:
+            child.communicate(timeout=TERMINATE_WAIT_S)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate(timeout=KILL_WAIT_S)
+
+    def close(self) -> None:
+        for child in self._started:
+            if child.poll() is None:
+                self.stop(child)
