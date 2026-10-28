@@ -10,6 +10,7 @@ from dotenv import dotenv_values
 
 from mprl.env_file import EnvVar, parse_env_example, prompt_values, render_env, write_env
 from mprl.errors import InvalidInput
+from mprl.negative_space import CheckFailed
 
 EXAMPLE = """\
 # Header block, not attached to any key.
@@ -39,7 +40,7 @@ def test_parse_env_example_marks_secrets() -> None:
 
 
 def test_parse_env_example_requires_a_comment_per_key() -> None:
-    with pytest.raises(AssertionError, match="NO_COMMENT"):
+    with pytest.raises(CheckFailed, match="NO_COMMENT"):
         parse_env_example("NO_COMMENT=1\n")
 
 

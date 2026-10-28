@@ -24,7 +24,7 @@ from mprl.errors import ConfigMismatch
 from mprl.hub import HubPublisher
 from mprl.negative_space import expect
 from mprl.paths import RunPaths
-from mprl.publish import finish_and_terminate
+from mprl.publish import PodGuard, finish_and_terminate
 from mprl.run_state import RunState, Status, load_state, save_state
 from mprl.train import TrainDeps, failed_after_final_checkpoint, train_run, wandb_run_id_for
 
@@ -248,3 +248,51 @@ def test_training_error_marks_the_run_failed_and_propagates(tmp_path: Path, trai
 
     stored = expect(load_state(RunPaths(tmp_path, SPEC).state_file), "no state.json after the failure")
     assert stored.status == "failed"
+
+
+def test_crash_mid_training_is_durable_before_the_pod_guard_terminates(tmp_path: Path, train: MagicMock) -> None:
+    """A crash after a checkpoint: state.json says failed and the checkpoint is on disk when the DELETE goes out."""
+    paths = RunPaths(tmp_path, SPEC)
+    events: list[tuple[str, object]] = []
+
+    def crash_after_a_checkpoint(*_args: object) -> None:
+        CheckpointStore(paths.checkpoints_dir).save_atomic(lambda p: p.write_bytes(b"weights"), 1, 1.0)
+        raise RuntimeError("env exploded")
+
+    def durable(state: RunState) -> object:
+        return state.status, [ref.path.name for ref in CheckpointStore(paths.checkpoints_dir).list()]
+
+    train.side_effect = crash_after_a_checkpoint
+
+    with (
+        pytest.raises(RuntimeError, match=r"^env exploded$"),
+        PodGuard(runpod_terminator(paths, events, durable), interactive=False),
+    ):
+        train_run(SPEC, tmp_path, DEPS)
+
+    assert events == [("DELETE", ("failed", ["model_it0000001_s000001.pt"]))]
+
+
+SECRETS = {"WANDB_API_KEY": "SENTINEL-wandb-3f9a1c7e5b", "HF_TOKEN": "hf_SENTINEL-hf-8d2e6a4c0f", "RUNPOD_API_KEY": "rpa_SENTINEL-rp"}
+
+
+def test_run_files_and_upload_never_contain_secrets(
+    tmp_path: Path, train: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in SECRETS.items():
+        monkeypatch.setenv(name, value)
+    train.side_effect = _trains(tmp_path)
+    staged: list[str] = []
+
+    def record_upload(**kwargs: Any) -> MagicMock:
+        staged.extend(p.read_text(errors="replace") for p in Path(kwargs["folder_path"]).rglob("*") if p.is_file())
+        staged.append(repr(kwargs))
+        return MagicMock(commit_url=f"https://huggingface.co/{REPO}/commit/abc")
+
+    publisher, _ = _publisher(record_upload)
+
+    train_run(SPEC, tmp_path, TrainDeps(publisher=publisher, wandb_mode="disabled", device="cpu"))
+
+    on_disk = [p.read_text(errors="replace") for p in tmp_path.rglob("*") if p.is_file()]
+    assert len(staged) == len(UPLOADED) + 1  # control: the upload ran
+    assert [name for name, value in SECRETS.items() if value in "\n".join(on_disk + staged)] == []

@@ -19,6 +19,7 @@ import torch
 
 import mprl.throughput as throughput_mod
 from mprl.evaluator import EvalConfig
+from mprl.negative_space import CheckFailed
 from mprl.throughput import CountMeasurement, measure_eval_seconds, measure_throughput
 
 
@@ -82,5 +83,5 @@ def test_memory_released_after_oom_frame_is_gone(tmp_path: Path, monkeypatch: py
 
 
 def test_eval_seconds_needs_a_checkpoint(tmp_path: Path) -> None:
-    with pytest.raises(AssertionError, match="no throughput checkpoint"):
+    with pytest.raises(CheckFailed, match=r"^no throughput checkpoint for num_envs=4 under "):
         measure_eval_seconds(tmp_path, 4, "cpu", EvalConfig())

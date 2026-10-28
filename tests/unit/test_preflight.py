@@ -16,7 +16,7 @@ from wandb.errors import AuthenticationError, CommError
 
 import mprl.preflight as preflight_mod
 from mprl.errors import MissingSecret, OwnPodUnknown, PreflightFailed
-from mprl.negative_space import require
+from mprl.negative_space import CheckFailed, require
 from mprl.preflight import (
     CheckResult,
     check_hf,
@@ -47,7 +47,7 @@ def test_run_checks_does_not_swallow_programmer_errors() -> None:
         require(False, "a bug in the check")
         return "unreachable"
 
-    with pytest.raises(AssertionError, match="a bug in the check"):
+    with pytest.raises(CheckFailed, match=r"^a bug in the check$"):
         run_checks([("broken", broken)])
 
 

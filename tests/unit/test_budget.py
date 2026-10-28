@@ -96,3 +96,33 @@ def test_measurements_round_trip_with_int_keys(tmp_path: Path) -> None:
 
     assert load_measurements(path) == m
     assert all(isinstance(n, int) for n in load_measurements(path).fits)
+
+
+def test_estimate_exactly_at_the_cap_needs_no_cut() -> None:
+    est = estimate(SweepSpec("main"), _m(io=0.35, eval_s=10.0))
+
+    sweep, cuts, planned = plan_within_budget(SweepSpec("main"), _m(io=0.35, eval_s=10.0), cap_usd=est.total_usd)
+
+    assert cuts == ()
+    assert sweep == SweepSpec("main")
+    assert planned == est
+
+
+def test_estimate_one_cent_over_the_cap_is_cut() -> None:
+    est = estimate(SweepSpec("main"), _m(io=0.35, eval_s=10.0))
+
+    _, cuts, planned = plan_within_budget(SweepSpec("main"), _m(io=0.35, eval_s=10.0), cap_usd=est.total_usd - 0.01)
+
+    assert cuts == ("eval_every_6min",)
+    assert planned.total_usd < est.total_usd - 0.01
+
+
+def test_fully_cut_sweep_exactly_at_the_cap_is_accepted() -> None:
+    m = _m(io=1.0)
+    cut_out = plan_within_budget(SweepSpec("main"), m)[2]  # every cut applied, within the $40 cap
+
+    sweep, cuts, planned = plan_within_budget(SweepSpec("main"), m, cap_usd=cut_out.total_usd)
+
+    assert cuts == CUT_ORDER
+    assert planned == cut_out
+    assert sweep.env_counts == (64, 256, 1024, 4096)

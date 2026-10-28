@@ -1,6 +1,7 @@
 import pytest
 
 from mprl.config import TASK_ID, RunSpec, SweepSpec, batch_arithmetic
+from mprl.negative_space import CheckFailed
 
 
 def test_runs_cover_every_count_and_seed() -> None:
@@ -38,15 +39,18 @@ def test_config_hash_changes_with_num_envs() -> None:
     assert RunSpec("main", 64, 0, 45.0).config_hash() != RunSpec("main", 256, 0, 45.0).config_hash()
 
 
-def test_run_spec_rejects_bad_values() -> None:
-    with pytest.raises(AssertionError):
-        RunSpec("main", 0, 0, 45.0)
-    with pytest.raises(AssertionError):
-        RunSpec("main", 64, 0, 0.0)
-    with pytest.raises(AssertionError):
-        RunSpec("main", 64, 0, 2.0, checkpoint_every_minutes=3.0)
-    with pytest.raises(AssertionError):
-        RunSpec("main", 64, 0, 45.0, checkpoint_every_minutes=0.0)
+@pytest.mark.parametrize(
+    ("num_envs", "budget", "every", "message"),
+    [
+        (0, 45.0, 3.0, r"^num_envs must be positive, got 0$"),
+        (64, 0.0, 3.0, r"^budget_minutes must be positive, got 0\.0$"),
+        (64, 2.0, 3.0, r"^checkpoint_every_minutes must be in \(0, budget_minutes\], got 3\.0 with budget 2\.0$"),
+        (64, 45.0, 0.0, r"^checkpoint_every_minutes must be in \(0, budget_minutes\], got 0\.0 with budget 45\.0$"),
+    ],
+)
+def test_run_spec_rejects_bad_values(num_envs: int, budget: float, every: float, message: str) -> None:
+    with pytest.raises(CheckFailed, match=message):
+        RunSpec("main", num_envs, 0, budget, checkpoint_every_minutes=every)
 
 
 def test_batch_arithmetic_64_envs() -> None:

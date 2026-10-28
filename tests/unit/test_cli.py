@@ -7,6 +7,7 @@ the terminator is an autospecced ``PodTerminator``. ``main`` runs in-process wit
 from __future__ import annotations
 
 import importlib.metadata
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
@@ -20,7 +21,7 @@ from mprl.errors import BudgetExceeded, OwnPodUnknown, TerminateFailed
 from mprl.results import build_results
 from mprl.run_state import RunState
 from mprl.runpod import PodTerminator
-from mprl.sweep import run_sweep
+from mprl.sweep import run_pilot, run_sweep
 from mprl.train import train_run
 
 EST = CostEstimate((("sweep runs", 10.0),), 10.0, 17.9)
@@ -46,7 +47,7 @@ def terminator(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return double
 
 
-def _main(tmp_path: Path, *argv: str) -> int:
+def _main(*argv: str) -> int:
     return cli.main(list(argv))
 
 
@@ -61,39 +62,40 @@ def _sweep_double(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> MagicMock:
 
 
 def test_sweep_budget_exceeded_unattended_terminates(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _measured(root)
     _sweep_double(monkeypatch, side_effect=BudgetExceeded("over the $40 cap"))
 
-    assert _main(tmp_path, "sweep", "--name", "main") == 1
+    assert _main("sweep", "--name", "main") == 1
 
     terminator.terminate.assert_called_once_with()
     assert "over the $40 cap" in capsys.readouterr().err
 
 
 def test_sweep_budget_exceeded_attended_still_terminates(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _measured(root)
     _sweep_double(monkeypatch, side_effect=BudgetExceeded("over"))
     monkeypatch.setattr(cli, "_interactive", lambda: True)
 
-    assert _main(tmp_path, "sweep", "--name", "main") == 1
+    assert _main("sweep", "--name", "main") == 1
 
     terminator.terminate.assert_called_once_with()
 
 
 def test_sweep_corrupt_measurements_terminates(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root.mkdir(parents=True)
     (root / "measurements.json").write_text("{not json")
     sweep = _sweep_double(monkeypatch)
 
-    with pytest.raises(ValueError, match="Expecting property name"):
-        _main(tmp_path, "sweep", "--name", "main")
+    with pytest.raises(json.JSONDecodeError, match=r"^Expecting ") as caught:
+        _main("sweep", "--name", "main")
 
+    assert (caught.value.doc, caught.value.pos) == ("{not json", 1)
     sweep.assert_not_called()
     terminator.terminate.assert_called_once_with()
 
@@ -108,7 +110,6 @@ TRAINING_ARGV = {
 @pytest.mark.parametrize("command", list(TRAINING_ARGV))
 def test_missing_hf_key_terminates(
     command: str,
-    tmp_path: Path,
     root: Path,
     terminator: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
@@ -117,37 +118,55 @@ def test_missing_hf_key_terminates(
     monkeypatch.delenv("HF_TOKEN")
     _measured(root)
 
-    assert _main(tmp_path, *TRAINING_ARGV[command]) == 1
+    assert _main(*TRAINING_ARGV[command]) == 1
 
     terminator.terminate.assert_called_once_with()
     assert "HF_TOKEN" in capsys.readouterr().err
 
 
-def test_training_error_terminates_then_propagates(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=RuntimeError("boom")))
+TRAINERS = {"train-run": ("train_run", train_run), "pilot": ("run_pilot", run_pilot), "sweep": ("run_sweep", run_sweep)}
 
-    with pytest.raises(RuntimeError, match="boom"):
-        _main(tmp_path, *TRAINING_ARGV["train-run"])
+
+@pytest.mark.parametrize("command", list(TRAINING_ARGV))
+def test_training_error_terminates_then_propagates(
+    command: str, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name, trainer = TRAINERS[command]
+    monkeypatch.setattr(cli, name, create_autospec(trainer, side_effect=RuntimeError("boom")))
+    _measured(root)
+
+    with pytest.raises(RuntimeError, match=r"^boom$"):
+        _main(*TRAINING_ARGV[command])
 
     terminator.terminate.assert_called_once_with()
 
 
+def test_pilot_terminates_after_the_pilot(root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    pilot = create_autospec(run_pilot, return_value=STATE)
+    monkeypatch.setattr(cli, "run_pilot", pilot)
+
+    assert _main(*TRAINING_ARGV["pilot"]) == 0
+
+    assert pilot.call_args.args[0].name == "main"
+    assert pilot.call_args.kwargs["terminator"] is None  # the CLI's guard terminates, once
+    terminator.terminate.assert_called_once_with()
+
+
 def test_failed_termination_keeps_the_original_error(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=RuntimeError("boom")))
     terminator.terminate.side_effect = TerminateFailed("DELETE of pod p failed with HTTP 500")
 
     with pytest.raises(RuntimeError, match="boom") as info:
-        _main(tmp_path, *TRAINING_ARGV["train-run"])
+        _main(*TRAINING_ARGV["train-run"])
 
-    assert info.value.__notes__ == ["pod termination also failed: TerminateFailed: DELETE of pod p failed with HTTP 500"]
+    assert info.value.__notes__ == [
+        "pod termination also failed: TerminateFailed: DELETE of pod p failed with HTTP 500"
+    ]
 
 
 def test_main_prints_the_termination_failure_with_an_operating_error(
-    tmp_path: Path,
     root: Path,
     terminator: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
@@ -156,7 +175,7 @@ def test_main_prints_the_termination_failure_with_an_operating_error(
     monkeypatch.delenv("HF_REPO_ID")
     terminator.terminate.side_effect = TerminateFailed("DELETE of pod p failed with HTTP 500")
 
-    assert _main(tmp_path, *TRAINING_ARGV["pilot"]) == 1
+    assert _main(*TRAINING_ARGV["pilot"]) == 1
 
     err = capsys.readouterr().err
     assert "MissingSecret: HF_REPO_ID is not set" in err
@@ -165,23 +184,23 @@ def test_main_prints_the_termination_failure_with_an_operating_error(
 
 @pytest.mark.parametrize(("tty", "terminated"), [(True, False), (False, True)])
 def test_keyboard_interrupt_terminates_only_without_a_terminal(
-    tty: bool, terminated: bool, tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    tty: bool, terminated: bool, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=KeyboardInterrupt()))
     monkeypatch.setattr(cli, "_interactive", lambda: tty)
 
     with pytest.raises(KeyboardInterrupt):
-        _main(tmp_path, *TRAINING_ARGV["train-run"])
+        _main(*TRAINING_ARGV["train-run"])
 
     assert terminator.terminate.called is terminated
 
 
 def test_sweep_without_measurements_terminates_before_training(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     sweep = _sweep_double(monkeypatch)
 
-    assert _main(tmp_path, "sweep", "--name", "main") == 1
+    assert _main("sweep", "--name", "main") == 1
 
     sweep.assert_not_called()
     terminator.terminate.assert_called_once_with()
@@ -189,12 +208,12 @@ def test_sweep_without_measurements_terminates_before_training(
 
 
 def test_sweep_no_terminate_never_builds_a_terminator(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _measured(root)
     sweep = _sweep_double(monkeypatch, side_effect=BudgetExceeded("over"))
 
-    assert _main(tmp_path, "sweep", "--name", "main", "--no-terminate") == 1
+    assert _main("sweep", "--name", "main", "--no-terminate") == 1
 
     cli.own_terminator.assert_not_called()  # type: ignore[attr-defined]
     assert sweep.call_args.kwargs["terminator"] is None
@@ -208,7 +227,7 @@ def _confirming(cuts: tuple[str, ...]) -> Any:
 
 
 def test_interactive_refusal_does_not_terminate(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _measured(root)
     _sweep_double(monkeypatch, side_effect=_confirming(("drop_16384",)))
@@ -216,7 +235,7 @@ def test_interactive_refusal_does_not_terminate(
     prompts: list[str] = []
     monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "n")
 
-    assert _main(tmp_path, "sweep", "--name", "main") == 1
+    assert _main("sweep", "--name", "main") == 1
 
     terminator.terminate.assert_not_called()
     out = capsys.readouterr().out
@@ -226,24 +245,24 @@ def test_interactive_refusal_does_not_terminate(
 
 
 def test_unattended_without_yes_refuses_and_terminates(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _measured(root)
     _sweep_double(monkeypatch, side_effect=_confirming(("drop_16384",)))
 
-    assert _main(tmp_path, "sweep", "--name", "main") == 1
+    assert _main("sweep", "--name", "main") == 1
 
     terminator.terminate.assert_called_once_with()
     assert "--yes" in capsys.readouterr().out
 
 
 def test_yes_confirms_after_printing_the_plan(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _measured(root)
     sweep = _sweep_double(monkeypatch, side_effect=_confirming(("two_seeds",)))
 
-    assert _main(tmp_path, "sweep", "--name", "main", "--yes", "--reuse-pilot") == 0
+    assert _main("sweep", "--name", "main", "--yes", "--reuse-pilot") == 0
 
     out = capsys.readouterr().out
     assert "two_seeds" in out
@@ -254,14 +273,16 @@ def test_yes_confirms_after_printing_the_plan(
 
 
 def test_train_run_refuses_before_training_without_pod_id(
-    tmp_path: Path, root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "rpa_key")
-    monkeypatch.setattr(runpod_mod, "own_pod_id", create_autospec(runpod_mod.own_pod_id, side_effect=OwnPodUnknown("no id")))
+    monkeypatch.setattr(
+        runpod_mod, "own_pod_id", create_autospec(runpod_mod.own_pod_id, side_effect=OwnPodUnknown("no id"))
+    )
     train = create_autospec(train_run)
     monkeypatch.setattr(cli, "train_run", train)
 
-    code = _main(tmp_path, "train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "0", "--minutes", "3")
+    code = _main("train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "0", "--minutes", "3")
 
     assert code == 1
     train.assert_not_called()
@@ -270,13 +291,13 @@ def test_train_run_refuses_before_training_without_pod_id(
 
 
 def test_train_run_refuses_without_api_key(
-    tmp_path: Path, root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("RUNPOD_POD_ID", "abc123")
     train = create_autospec(train_run)
     monkeypatch.setattr(cli, "train_run", train)
 
-    assert _main(tmp_path, "train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "0", "--minutes", "3") == 1
+    assert _main("train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "0", "--minutes", "3") == 1
 
     train.assert_not_called()
     err = capsys.readouterr().err
@@ -284,13 +305,11 @@ def test_train_run_refuses_without_api_key(
     assert "--no-terminate" in err
 
 
-def test_train_run_terminates_after_the_run(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_train_run_terminates_after_the_run(root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
     train = create_autospec(train_run, return_value=STATE)
     monkeypatch.setattr(cli, "train_run", train)
 
-    assert _main(tmp_path, "train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "1", "--minutes", "3") == 0
+    assert _main("train-run", "--sweep", "dbg", "--num-envs", "64", "--seed", "1", "--minutes", "3") == 0
 
     spec = train.call_args.args[0]
     assert (spec.sweep, spec.num_envs, spec.seed, spec.budget_minutes) == ("dbg", 64, 1, 3.0)
@@ -299,23 +318,22 @@ def test_train_run_terminates_after_the_run(
 
 
 def test_results_leaves_the_pod_by_default(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     results = create_autospec(build_results, return_value=root / "out")
     monkeypatch.setattr(cli, "build_results", results)
 
-    assert _main(tmp_path, "results", "--name", "main", "--primary-metric", "vel_error_xy") == 0
+    assert _main("results", "--name", "main", "--primary-metric", "vel_error_xy") == 0
 
     assert results.call_args.kwargs["primary_metric"] == "vel_error_xy"
+    assert capsys.readouterr().out.splitlines()[-1] == f"results in {root / 'out'}"
     cli.own_terminator.assert_not_called()  # type: ignore[attr-defined]
 
 
-def test_results_terminate_flag_terminates(
-    tmp_path: Path, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_results_terminate_flag_terminates(root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "build_results", create_autospec(build_results, return_value=root / "out"))
 
-    assert _main(tmp_path, "results", "--name", "main", "--primary-metric", "vel_error_xy", "--terminate") == 0
+    assert _main("results", "--name", "main", "--primary-metric", "vel_error_xy", "--terminate") == 0
 
     terminator.terminate.assert_called_once_with()
 

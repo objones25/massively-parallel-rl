@@ -71,17 +71,23 @@ class CompletedRun:
     state: RunState  # what train_run returned
 
 
-def runpod_terminator(paths: RunPaths, events: list[tuple[str, object]]) -> PodTerminator:
+def _uploads(state: RunState) -> object:
+    return state.uploads
+
+
+def runpod_terminator(
+    paths: RunPaths, events: list[tuple[str, object]], snapshot: Callable[[RunState], object] = _uploads
+) -> PodTerminator:
     """A real ``PodTerminator`` over a RunPod double: RUNNING until DELETE, then 404.
 
-    The DELETE appends ``("DELETE", uploads)`` with the uploads read from ``state.json`` on disk at that
-    moment, so a test can assert what was durable before the pod went away.
+    The DELETE appends ``("DELETE", snapshot(state))`` with the ``state.json`` read from disk at that
+    moment (by default its uploads), so a test can assert what was durable before the pod went away.
     """
 
     def handle(request: httpx.Request) -> httpx.Response:
         if request.method == "DELETE":
             on_disk = expect(load_state(paths.state_file), "no state.json at DELETE time")
-            events.append(("DELETE", on_disk.uploads))
+            events.append(("DELETE", snapshot(on_disk)))
             return httpx.Response(204)
         if any(name == "DELETE" for name, _ in events):
             return httpx.Response(404)
