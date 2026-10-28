@@ -1,6 +1,10 @@
 .env
 .superpowers/
-.venv/
+# .venv is a symlink to .venv.nosync: iCloud "Desktop & Documents" skips *.nosync, so the
+# environment is never evicted to cloud placeholders.
+.venv
+.venv.nosync/
+.venv-icloud-old/
 __pycache__/
 *.py[cod]
 .pytest_cache/
