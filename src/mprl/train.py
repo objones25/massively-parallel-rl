@@ -141,17 +141,19 @@ def built_runner(
     *,
     params_dir: Path | None = None,
     env_cfg: ManagerBasedRlEnvCfg | None = None,
+    render_mode: str | None = None,
 ) -> Generator[TimedOnPolicyRunner]:
     """The real env (``resolve_cfgs``) wrapped in a fresh ``TimedOnPolicyRunner``; the env is closed on exit.
 
     With ``params_dir`` the env and agent configs are dumped there before the runner exists, as mjlab
     does: the runner mutates ``agent_cfg`` in place. With ``env_cfg`` that env config is built instead of
     the training one (the evaluator's play env); the agent config, and so the policy, is unchanged.
+    ``render_mode`` is passed to the env (``"rgb_array"`` for ``env.render()``).
     """
     training_env_cfg, agent_cfg = resolve_cfgs(spec, logger)
     env_cfg = training_env_cfg if env_cfg is None else env_cfg
     configure_torch_backends()  # as mjlab's train script
-    env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
     try:
         if params_dir is not None:
             dump_yaml(params_dir / "env.yaml", asdict(env_cfg))

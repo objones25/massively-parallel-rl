@@ -15,7 +15,7 @@ How a command is pinned (mjlab 1.6.0, ``mjlab/tasks/velocity/mdp/velocity_comman
   (``is_standing_env``, zeroed); ``_resample_command`` rewrites forward envs (``rel_forward_envs``) and
   ``reset`` may start an env moving (``init_velocity_prob``). The config turns all of these off
   (``heading_command=False``, ``ranges.heading=None``, every ``rel_*`` and ``init_velocity_prob`` 0), and
-  ``_pin`` also clears the per-env flags, because ``uniform(0, 1) <= 0.0`` can still draw True.
+  ``pin_command`` also clears the per-env flags, because ``uniform(0, 1) <= 0.0`` can still draw True.
 * After ``reset(seed=...)`` the command buffer ``vel_command_b`` (``.command``) is written with the
   pinned commands and the observations are recomputed, so the first action already sees them. The
   policy observes exactly the play-mode observation terms; none is altered.
@@ -169,26 +169,42 @@ def eval_env_cfg(cfg: EvalConfig) -> ManagerBasedRlEnvCfg:
 
 
 @contextmanager
-def loaded_policy(ref: CheckpointRef, cfg: EvalConfig, device: str) -> Generator[tuple[RslRlVecEnvWrapper, Policy]]:
-    """The eval env plus ``ref``'s inference policy, loaded into a fresh runner; the env is closed on exit."""
+def loaded_policy(
+    ref: CheckpointRef, cfg: EvalConfig, device: str, *, render_size: tuple[int, int] | None = None
+) -> Generator[tuple[RslRlVecEnvWrapper, Policy]]:
+    """The eval env plus ``ref``'s inference policy, loaded into a fresh runner; the env is closed on exit.
+
+    With ``render_size=(height, width)`` the env is built with ``render_mode="rgb_array"`` at that viewer size.
+    """
     require(ref.path.is_file(), f"checkpoint {ref.path} does not exist")
     spec = RunSpec(_EVAL_SWEEP, cfg.num_envs, cfg.seeds[0], _UNUSED_BUDGET_MIN)
+    env_cfg = eval_env_cfg(cfg)
+    if render_size is not None:
+        require(min(render_size) >= 1, f"render_size must be positive, got {render_size}")
+        env_cfg.viewer.height, env_cfg.viewer.width = render_size
     with (
         tempfile.TemporaryDirectory(prefix="mprl-eval-") as log_dir,
-        built_runner(spec, device, "tensorboard", Path(log_dir), env_cfg=eval_env_cfg(cfg)) as runner,
+        built_runner(
+            spec,
+            device,
+            "tensorboard",
+            Path(log_dir),
+            env_cfg=env_cfg,
+            render_mode=None if render_size is None else "rgb_array",
+        ) as runner,
     ):
         runner.load(str(ref.path), map_location=device)
         policy = runner.get_inference_policy(device)
         yield runner.env, policy  # pyright: ignore[reportReturnType]  rsl_rl types env as VecEnv
 
 
-def _twist(env: ManagerBasedRlEnv) -> UniformVelocityCommand:
+def twist_term(env: ManagerBasedRlEnv) -> UniformVelocityCommand:
     term = env.command_manager.get_term(_TWIST)
     require(isinstance(term, UniformVelocityCommand), f"{_TWIST} is not a UniformVelocityCommand")
     return term  # pyright: ignore[reportReturnType]  narrowed by the require above
 
 
-def _pin(twist: UniformVelocityCommand, pinned: torch.Tensor) -> None:
+def pin_command(twist: UniformVelocityCommand, pinned: torch.Tensor) -> None:
     twist.vel_command_b[:] = pinned
     twist.vel_command_w[:] = pinned
     twist.is_heading_env[:] = False
@@ -210,7 +226,7 @@ def horizon_steps(cfg: EvalConfig, step_dt: float) -> int:
 def rollout(env: RslRlVecEnvWrapper, policy: Policy, cfg: EvalConfig, seed: int) -> SeedStats:
     """Reset with ``seed``, pin the commands, step the horizon: one seed's metrics."""
     raw = env.unwrapped
-    twist = _twist(raw)
+    twist = twist_term(raw)
     pinned = command_tensor(cfg, raw.device)
     check_shape(twist.command, (raw.num_envs, 3), name="twist command")
     check_shape(pinned, (raw.num_envs, 3), name="pinned commands")
@@ -219,7 +235,7 @@ def rollout(env: RslRlVecEnvWrapper, policy: Policy, cfg: EvalConfig, seed: int)
     tracking = raw.reward_manager.get_term_cfg(_TRACKING_TERM)
     with torch.inference_mode():
         raw.reset(seed=seed)
-        _pin(twist, pinned)
+        pin_command(twist, pinned)
         raw.observation_manager.compute(update_history=True)  # observations with the pinned command
         obs = env.get_observations()
         standing = torch.ones(raw.num_envs, dtype=torch.bool, device=raw.device)
@@ -242,7 +258,7 @@ def rollout(env: RslRlVecEnvWrapper, policy: Policy, cfg: EvalConfig, seed: int)
             sum_yaw += weight * torch.abs(pinned[:, 2] - robot.data.root_link_ang_vel_b[:, 2])
             sum_reward += weight * tracking.func(raw, **tracking.params)
             counted += weight
-            _pin(twist, pinned)  # fallen envs were reset and resampled; keep the buffer fixed
+            pin_command(twist, pinned)  # fallen envs were reset and resampled; keep the buffer fixed
         require(bool(torch.all(twist.command_counter[standing] == 1)), "a standing env's command was resampled")
         total = counted.sum()
         return SeedStats(
