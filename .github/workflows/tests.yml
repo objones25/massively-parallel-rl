@@ -1,0 +1,60 @@
+# Audits, lint, types and the default test suite. Runs on pull requests and on pushes to branches that
+# image.yml does not cover; image.yml calls this workflow (workflow_call) before it builds on main and feat/**,
+# so those pushes are tested exactly once.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main, "feat/**"]
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+  UV_FROZEN: "1"
+
+jobs:
+  tests:
+    name: audits, lint, types, pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          enable-cache: false
+      - name: System libraries (EGL for mjlab)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1 libgl1 libglib2.0-0
+      - name: Install
+        run: uv sync --frozen
+      - name: Audit test suite
+        run: uv run --no-sync python scripts/audit_tests.py tests/
+      - name: Audit negative space
+        run: uv run --no-sync python scripts/audit_negative_space.py src/ --select NSP002,NSP003,NSP005,NSP006,NSP007
+      - name: Ruff
+        run: uv run --no-sync ruff check .
+      - name: Pyright
+        run: uv run --no-sync pyright src
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck scripts/*.sh docker/*.sh
+      # Fast + smoke tiers with the branch-coverage floor: the coverage gate the local default (fast-only) run
+      # does not enforce. network (needs keys) and gpu (needs CUDA) run elsewhere.
+      - name: Tests (fast + smoke, coverage floor)
+        run: >-
+          uv run --no-sync pytest -m "not network and not gpu"
+          --cov --cov-branch --cov-report=xml --cov-report=term --cov-fail-under=80

@@ -71,6 +71,51 @@ def test_setup_sh_refuses_without_a_workspace_mount(subprocesses: Any) -> None:
     assert "--allow-no-volume" in done.stderr
 
 
+def _fake_uv(tmp_path: Path) -> tuple[Path, Path]:
+    """A ``uv`` that records its arguments, one call per line, and succeeds; returns (bin dir, log)."""
+    bin_dir, log = tmp_path / "bin", tmp_path / "uv-calls.log"
+    bin_dir.mkdir()
+    fake = bin_dir / "uv"
+    fake.write_text(f'#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> {log}\n', encoding="utf-8")
+    fake.chmod(0o755)
+    return bin_dir, log
+
+
+def _base_provided() -> list[str]:
+    lines = (REPO / "docker" / "base-provided-packages.txt").read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def test_setup_sh_skips_base_provided_packages_in_the_image_venv(tmp_path: Path, subprocesses: Any) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    bin_dir, log = _fake_uv(tmp_path)
+    env = {**_env(), "PATH": f"{bin_dir}:{os.environ['PATH']}", "UV_PROJECT_ENVIRONMENT": "/opt/venv"}
+
+    done = subprocesses.run(
+        [bash, str(REPO / "scripts" / "setup.sh"), "--allow-no-volume"], env=env, timeout_s=PROCESS_TIMEOUT_S
+    )
+
+    assert done.returncode == 0, done.stderr
+    sync = log.read_text(encoding="utf-8").splitlines()[0]
+    expected = " ".join(f"--no-install-package {name}" for name in _base_provided())
+    assert sync == f"sync --frozen {expected}"
+
+
+def test_setup_sh_installs_everything_outside_the_image_venv(tmp_path: Path, subprocesses: Any) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    bin_dir, log = _fake_uv(tmp_path)
+    env = {**_env(), "PATH": f"{bin_dir}:{os.environ['PATH']}", "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv")}
+
+    done = subprocesses.run(
+        [bash, str(REPO / "scripts" / "setup.sh"), "--allow-no-volume"], env=env, timeout_s=PROCESS_TIMEOUT_S
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == ["sync --frozen", "run --no-sync mprl setup"]
+
+
 def test_preflight_cpu_passes_local_checks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -4,10 +4,14 @@
 # is mounted, installs the project into the image's environment, then runs `mprl setup`, which asks
 # for the API keys, writes .env (mode 0600) in the repo root and runs the preflight checks.
 #
+# In the image's environment (/opt/venv) it syncs through docker/uv-sync-base.sh, which skips every
+# package in docker/base-provided-packages.txt (torch, torchvision, triton, nvidia-*): the image reuses
+# the base's copies through --system-site-packages, and a plain `uv sync` would download them again.
+#
 # Usage: scripts/setup.sh [--allow-no-volume] [mprl setup options, e.g. --cpu]
 #   --allow-no-volume   skip the /workspace mount check (local testing only)
 # Requires: bash 3.2+, uv, awk, and /proc/mounts (Linux) unless --allow-no-volume.
-# Exit status: 1 when /workspace is not mounted or uv sync fails; otherwise that of `mprl setup`.
+# Exit status: 1 when /workspace is not mounted or the sync fails; otherwise that of `mprl setup`.
 # bash-target: 3.2
 
 set -Eeuo pipefail
@@ -46,7 +50,11 @@ main() {
   if [[ -z ${UV_PROJECT_ENVIRONMENT:-} && -d $IMAGE_VENV ]]; then
     export UV_PROJECT_ENVIRONMENT=$IMAGE_VENV
   fi
-  uv sync --frozen || die "uv sync --frozen failed"
+  if [[ ${UV_PROJECT_ENVIRONMENT:-} == "$IMAGE_VENV" ]]; then
+    docker/uv-sync-base.sh || die "docker/uv-sync-base.sh (uv sync --frozen without the base's packages) failed"
+  else
+    uv sync --frozen || die "uv sync --frozen failed"
+  fi
   exec uv run --no-sync mprl setup ${forward[@]+"${forward[@]}"}
 }
 
