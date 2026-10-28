@@ -7,6 +7,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
+from mprl.negative_space import CheckFailed
 
 
 def _write_ok(path: Path) -> None:
@@ -99,3 +100,16 @@ def test_at_or_before_never_exceeds_query(seconds: set[int], minutes: float):
         ref = store.at_or_before(minutes)
         expected = max((x for x in seconds if x <= minutes * 60.0), default=None)
         assert getattr(ref, "train_seconds", None) == expected
+
+
+def test_largest_representable_seconds_is_saved_and_listed(tmp_path: Path):
+    store = CheckpointStore(tmp_path)
+    ref = store.save_atomic(_write_ok, 1, 999_999.4)
+    assert store.list() == [ref]
+
+
+def test_seconds_that_round_past_six_digits_are_rejected(tmp_path: Path):
+    store = CheckpointStore(tmp_path)
+    with pytest.raises(CheckFailed, match="train_seconds"):
+        store.save_atomic(_write_ok, 1, 999_999.5)
+    assert list(tmp_path.iterdir()) == []

@@ -36,8 +36,9 @@ class CheckpointStore:
         self, write: Callable[[Path], None], iteration: int, train_seconds: float
     ) -> CheckpointRef:
         require(0 <= iteration <= 9_999_999, f"iteration out of range: {iteration}")
-        require(0.0 <= train_seconds < 1_000_000.0, f"train_seconds out of range: {train_seconds}")
+        require(train_seconds >= 0.0, f"train_seconds out of range: {train_seconds}")
         seconds = round(train_seconds)
+        require(seconds <= 999_999, f"train_seconds out of range: {train_seconds}")
         name = f"model_it{iteration:07d}_s{seconds:06d}.pt"
         final = self._dir / name
         tmp = self._dir / f".{name}.tmp"
