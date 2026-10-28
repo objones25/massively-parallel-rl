@@ -121,6 +121,11 @@ scripts/train.sh results --name main --primary-metric vel_error_xy   # off the c
 without `RUNPOD_API_KEY` or a pod id unless `--no-terminate` is given. All take `--device` (default `cuda:0`
 when available) and `--wandb-mode online|offline|disabled`.
 
+SIGTERM (`kill`, `docker stop`, a RunPod stop) during `train-run`, `pilot`, `sweep` or `results` is a failure exit:
+the handler (`publish.sigterm_raises`, installed only while the command runs) raises `Terminated`, so `state.json`
+is saved `failed`, the pod is terminated (unless `--no-terminate`; `results` only with `--terminate`) and the exit
+status is 1. A repeated SIGTERM during that cleanup is ignored. Ctrl-C at a terminal still keeps the pod.
+
 ## Where tests run
 
 Tiers are set by directory (`tests/conftest.py`): `tests/unit` is the default fast tier; `tests/smoke`,

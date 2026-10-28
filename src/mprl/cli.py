@@ -5,8 +5,10 @@ overriding variables already set.
 
 Termination: ``train-run``, ``pilot`` and ``sweep`` build the pod's ``PodTerminator`` before anything else
 (no key or no pod id: refuse, naming ``--no-terminate``). From then on one ``PodGuard`` terminates the pod
-on any exit (success, a missing key, corrupt measurements, a crash) except a cut plan refused at the prompt
-and Ctrl-C at a terminal. ``results`` does the same only with ``--terminate``; ``setup``, ``preflight`` and
+on any exit (success, a missing key, corrupt measurements, a crash, SIGTERM) except a cut plan refused at the
+prompt and Ctrl-C at a terminal. SIGTERM (``kill``, ``docker stop``, a RunPod stop) is a failure: it raises
+``Terminated`` in the main thread, so a run in progress is saved as failed, the pod is terminated (unless
+``--no-terminate``) and the exit status is 1. ``results`` does the same only with ``--terminate``; ``setup``, ``preflight`` and
 ``throughput`` never terminate.
 """
 
@@ -39,7 +41,7 @@ from mprl.hub import HubPublisher
 from mprl.negative_space import require
 from mprl.paths import volume_root
 from mprl.preflight import default_checks, run_checks
-from mprl.publish import PodGuard
+from mprl.publish import PodGuard, sigterm_raises
 from mprl.results import build_results
 from mprl.runpod import own_terminator
 from mprl.sweep import run_pilot, run_sweep
@@ -72,7 +74,11 @@ def _env_file() -> Path:
 
 @contextmanager
 def _pod_guard(no_terminate: bool, hint: str = _NO_TERMINATE_HINT) -> Generator[PodGuard]:
-    """Build this pod's terminator (key and pod id checked) first, then guard the block with it."""
+    """Build this pod's terminator (key and pod id checked) first, then guard the block with it.
+
+    While the block runs SIGTERM raises ``Terminated`` (``sigterm_raises``); from the block's end until the
+    guard has terminated the pod a SIGTERM is ignored; then the previous handler is back.
+    """
     with httpx.Client(timeout=_RUNPOD_TIMEOUT_S) as client:
         terminator = None
         if not no_terminate:
@@ -80,8 +86,11 @@ def _pod_guard(no_terminate: bool, hint: str = _NO_TERMINATE_HINT) -> Generator[
                 terminator = own_terminator(os.environ, client)
             except MprlOperatingError as error:
                 raise type(error)(f"{error}; {hint}") from error
-        with PodGuard(terminator, interactive=_interactive()) as guard:
-            yield guard
+        with sigterm_raises() as sigterm, PodGuard(terminator, interactive=_interactive()) as guard:
+            try:
+                yield guard
+            finally:
+                sigterm.shield()  # the guard's cleanup (summary, os.sync, DELETE) runs to the end
 
 
 def _deps(device: str, wandb_mode: str) -> TrainDeps:

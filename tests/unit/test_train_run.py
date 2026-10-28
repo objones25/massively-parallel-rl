@@ -7,6 +7,8 @@ and upload-retry paths, the W&B id choice, state.json, the upload staging and th
 
 from __future__ import annotations
 
+import os
+import signal
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -19,12 +21,13 @@ from support import runpod_terminator
 import mprl.publish as publish_mod
 import mprl.train as train_mod
 from mprl.checkpoints import CheckpointRef, CheckpointStore
+from mprl.clock import TrainingClock
 from mprl.config import RunSpec
-from mprl.errors import ConfigMismatch
+from mprl.errors import ConfigMismatch, Terminated
 from mprl.hub import HubPublisher
 from mprl.negative_space import expect
 from mprl.paths import RunPaths
-from mprl.publish import PodGuard, finish_and_terminate
+from mprl.publish import PodGuard, finish_and_terminate, sigterm_raises
 from mprl.run_state import RunState, Status, load_state, save_state
 from mprl.train import TrainDeps, failed_after_final_checkpoint, train_run, wandb_run_id_for
 
@@ -271,6 +274,78 @@ def test_crash_mid_training_is_durable_before_the_pod_guard_terminates(tmp_path:
         train_run(SPEC, tmp_path, DEPS)
 
     assert events == [("DELETE", ("failed", ["model_it0000001_s000001.pt"]))]
+
+
+@pytest.mark.usefixtures("sigterm_sentinel")
+def test_sigterm_mid_training_leaves_the_run_failed_before_the_pod_guard_terminates(
+    tmp_path: Path, train: MagicMock
+) -> None:
+    """SIGTERM after a checkpoint, under the CLI's handler: state.json is failed when the DELETE goes out."""
+    paths = RunPaths(tmp_path, SPEC)
+    events: list[tuple[str, object]] = []
+
+    def sigterm_after_a_checkpoint(*_args: object) -> None:
+        CheckpointStore(paths.checkpoints_dir).save_atomic(lambda p: p.write_bytes(b"weights"), 1, 1.0)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def durable(state: RunState) -> object:
+        return state.status, [ref.path.name for ref in CheckpointStore(paths.checkpoints_dir).list()]
+
+    train.side_effect = sigterm_after_a_checkpoint
+
+    with (
+        pytest.raises(Terminated, match=r"^received SIGTERM"),
+        sigterm_raises(),
+        PodGuard(runpod_terminator(paths, events, durable), interactive=False),
+    ):
+        train_run(SPEC, tmp_path, DEPS)
+
+    assert events == [("DELETE", ("failed", ["model_it0000001_s000001.pt"]))]
+
+
+class _StubDiagnostics:
+    def attach(self) -> None: ...
+    def detach(self) -> None: ...
+
+
+class _RunnerTerminatedAfterTheFinalCheckpoint:
+    """Duck-types what ``train._learn`` uses of ``TimedOnPolicyRunner``: the final checkpoint, then SIGTERM."""
+
+    current_learning_iteration = 3
+
+    def learn_for(self, *_args: object, on_checkpoint: Callable[[CheckpointRef], None], **_kwargs: object) -> None:
+        on_checkpoint(_ref(3, 2.0))
+        raise Terminated("received SIGTERM; stopping")
+
+    def export_policy_to_onnx(self, path: str, filename: str) -> None:
+        raise AssertionError(f"exported {path}/{filename}: a terminated run must not continue post-training work")
+
+
+def test_sigterm_after_the_final_checkpoint_is_a_failure_not_a_post_training_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        train_mod.diagnostics, "for_runner", lambda *_args: (_StubDiagnostics(), lambda _it: None, lambda _it: None)
+    )
+    runner = _RunnerTerminatedAfterTheFinalCheckpoint()
+    budget_s = SPEC.budget_minutes * 60.0
+
+    with pytest.raises(Terminated, match=r"^received SIGTERM"):
+        train_mod._learn(  # type: ignore[arg-type]  duck-typed runner
+            SPEC, RunPaths(tmp_path, SPEC), DEPS, runner, TrainingClock(budget_s), budget_s, fresh_start=True
+        )
+
+
+class _RunnerTerminatedDuringExport:
+    current_learning_iteration = 3
+
+    def export_policy_to_onnx(self, path: str, filename: str) -> None:
+        raise Terminated(f"received SIGTERM; stopping (exporting {path}/{filename})")
+
+
+def test_sigterm_during_onnx_export_propagates() -> None:
+    with pytest.raises(Terminated, match=r"^received SIGTERM"):
+        publish_mod.export_onnx(_RunnerTerminatedDuringExport(), _ref(3, 2.0))  # type: ignore[arg-type]  duck-typed
 
 
 SECRETS = {"WANDB_API_KEY": "SENTINEL-wandb-3f9a1c7e5b", "HF_TOKEN": "hf_SENTINEL-hf-8d2e6a4c0f", "RUNPOD_API_KEY": "rpa_SENTINEL-rp"}

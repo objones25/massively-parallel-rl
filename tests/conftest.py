@@ -16,6 +16,7 @@ import importlib.util
 import ipaddress
 import os
 import random
+import signal
 import socket
 import subprocess
 import sys
@@ -266,3 +267,25 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def pytest_report_header(config: pytest.Config) -> list[str]:
     """Print the seed in the run header; it is what lets you reproduce a CI failure."""
     return [f"pytest-expert: seed={SEED} python={sys.version.split()[0]}"]
+
+
+# --------------------------------------------------------------------------
+# Signals
+# --------------------------------------------------------------------------
+@pytest.fixture
+def sigterm_sentinel() -> Iterator[list[int]]:
+    """A non-fatal SIGTERM handler in place of the default (which would end pytest); yields what it received.
+
+    A guarded command must take SIGTERM over while it runs (the sentinel then receives nothing) and put this
+    handler back afterwards.
+    """
+    received: list[int] = []
+
+    def sentinel(signum: int, _frame: object) -> None:
+        received.append(signum)
+
+    previous = signal.signal(signal.SIGTERM, sentinel)
+    try:
+        yield received
+    finally:
+        signal.signal(signal.SIGTERM, previous)

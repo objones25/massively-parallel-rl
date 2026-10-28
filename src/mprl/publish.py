@@ -9,13 +9,17 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import signal
+import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal
 
 from huggingface_hub.errors import HfHubHTTPError
 
-from mprl.errors import UploadFailed
+from mprl.errors import Terminated, UploadFailed
 from mprl.negative_space import require
 
 if TYPE_CHECKING:
@@ -47,6 +51,8 @@ def export_onnx(runner: TimedOnPolicyRunner, final: CheckpointRef) -> str | None
     require(runner.current_learning_iteration == final.iteration, "runner does not hold the final checkpoint")
     try:
         runner.export_policy_to_onnx(str(final.path.parent), onnx_path(final).name)
+    except Terminated:
+        raise  # SIGTERM is a failure exit, never a recorded export error
     except Exception as error:
         log.warning("ONNX export for %s failed: %s", final.path.name, error)
         return f"{type(error).__name__}: {error}"
@@ -149,3 +155,46 @@ class PodGuard:
             log.error(note)
             exc.add_note(note)
         return False
+
+
+
+class SigtermHandler:
+    """The SIGTERM handler ``sigterm_raises`` installs: the first SIGTERM raises ``Terminated``, once.
+
+    Python runs it in the main thread between bytecodes, so the exception surfaces wherever the main thread
+    is (env step, PPO update, an upload) and unwinds through ``train_run`` (``state.json`` -> failed) into the
+    ``PodGuard``. After that first raise, or after ``shield()`` (the guarded block has ended and its cleanup is
+    running), a SIGTERM is logged and ignored: ``docker stop`` can repeat it, and the state save and the pod
+    DELETE it would interrupt are what it is asking for.
+    """
+
+    def __init__(self) -> None:
+        self._armed = True
+
+    def shield(self) -> None:
+        self._armed = False
+
+    def __call__(self, signum: int, _frame: object) -> None:
+        require(signum == signal.SIGTERM, f"SigtermHandler installed for signal {signum}")
+        if not self._armed:
+            log.warning("SIGTERM again while stopping; finishing the cleanup first")
+            return
+        self._armed = False
+        raise Terminated(f"received SIGTERM (signal {signum}); stopping")
+
+
+@contextmanager
+def sigterm_raises() -> Generator[SigtermHandler]:
+    """Make SIGTERM a ``Terminated`` operating error for the block; restore the previous handler on exit.
+
+    Without it Python's default SIGTERM action ends the process without running ``finally`` or ``__exit__``:
+    no failed ``state.json``, no pod termination. Signal handlers can only be set from the main thread.
+    """
+    require(threading.current_thread() is threading.main_thread(), "SIGTERM handler set off the main thread")
+    handler = SigtermHandler()
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield handler
+    finally:
+        # None: the previous handler was not installed from Python; the default is the closest equivalent.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)

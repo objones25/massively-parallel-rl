@@ -49,3 +49,7 @@ class PreflightFailed(MprlOperatingError):
 
 class InvalidInput(MprlOperatingError):
     """A value the user typed is not acceptable (after any retries)."""
+
+
+class Terminated(MprlOperatingError):
+    """The process received SIGTERM (``kill``, ``docker stop``, a RunPod stop) during a guarded command."""

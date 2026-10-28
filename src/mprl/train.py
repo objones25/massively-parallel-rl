@@ -33,7 +33,7 @@ from mprl import diagnostics
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import RunSpec, batch_arithmetic
-from mprl.errors import ConfigMismatch
+from mprl.errors import ConfigMismatch, Terminated
 from mprl.negative_space import expect, require
 from mprl.paths import RunPaths
 from mprl.publish import export_onnx, hub_path, upload_run
@@ -344,6 +344,8 @@ def _learn(
             on_before_update=on_before_update,
             on_checkpoint=saved.append,
         )
+    except Terminated:
+        raise  # SIGTERM is a failure exit even after the final checkpoint (cli: ``sigterm_raises``)
     except Exception as error:
         # After the final checkpoint learn_for only stops the writer and exports ONNX. A failure there
         # must not discard a finished run: record it. Anything earlier is a training failure.

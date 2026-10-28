@@ -7,6 +7,8 @@ the terminator is an autospecced ``PodTerminator``. ``main`` runs in-process wit
 from __future__ import annotations
 
 import importlib.metadata
+import os
+import signal
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
@@ -387,3 +389,95 @@ def test_env_file_override_is_loaded(
     out = capsys.readouterr().out
     assert code == 0, out
     assert f"{tmp_path / 'from-env-file'} is writable" in out
+
+
+# --- SIGTERM (kill, docker stop, RunPod stop) is a failure exit of every guarded command ---------------
+
+
+def _sigterm_self(*_args: object, **_kwargs: object) -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+GUARDED_ARGV = {
+    **TRAINING_ARGV,
+    "results-terminate": ("results", "--name", "main", "--primary-metric", "vel_error_xy", "--terminate"),
+}
+GUARDED_BODIES = {**TRAINERS, "results-terminate": ("build_results", build_results)}
+
+
+@pytest.mark.parametrize("command", list(GUARDED_ARGV))
+def test_sigterm_mid_command_terminates_the_pod_and_exits_nonzero(
+    command: str,
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sigterm_sentinel: list[int],
+) -> None:
+    name, body = GUARDED_BODIES[command]
+    monkeypatch.setattr(cli, name, create_autospec(body, side_effect=_sigterm_self))
+    _measured(root)
+
+    assert _main(*GUARDED_ARGV[command]) == 1
+
+    terminator.terminate.assert_called_once_with()
+    assert "mprl: Terminated: received SIGTERM" in capsys.readouterr().err
+    assert sigterm_sentinel == []
+
+
+@pytest.mark.parametrize("command", list(GUARDED_ARGV))
+def test_guarded_command_restores_the_previous_sigterm_handler(
+    command: str, root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, sigterm_sentinel: list[int]
+) -> None:
+    name, body = GUARDED_BODIES[command]
+    monkeypatch.setattr(cli, name, create_autospec(body, side_effect=_sigterm_self))
+    _measured(root)
+    _main(*GUARDED_ARGV[command])
+
+    os.kill(os.getpid(), signal.SIGTERM)
+
+    assert sigterm_sentinel == [signal.SIGTERM]
+
+
+def test_sigterm_at_a_terminal_still_terminates(
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, sigterm_sentinel: list[int]
+) -> None:
+    """Unlike Ctrl-C, SIGTERM never comes from the user at the keyboard, so it does not keep the pod."""
+    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=_sigterm_self))
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+
+    assert _main(*TRAINING_ARGV["train-run"]) == 1
+
+    terminator.terminate.assert_called_once_with()
+
+
+def test_second_sigterm_during_termination_is_ignored(
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sigterm_sentinel: list[int],
+) -> None:
+    """``docker stop`` may repeat SIGTERM; the cleanup it interrupts (state save, the DELETE) must still finish."""
+    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, side_effect=_sigterm_self))
+    terminator.terminate.side_effect = _sigterm_self
+
+    assert _main(*TRAINING_ARGV["train-run"]) == 1
+
+    terminator.terminate.assert_called_once_with()
+    err = capsys.readouterr().err
+    assert err.count("mprl: Terminated: received SIGTERM") == 1
+    assert "pod termination also failed" not in err
+    assert sigterm_sentinel == []
+
+
+def test_sigterm_after_a_successful_body_is_ignored_until_the_pod_is_terminated(
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, sigterm_sentinel: list[int]
+) -> None:
+    monkeypatch.setattr(cli, "train_run", create_autospec(train_run, return_value=STATE))
+    terminator.terminate.side_effect = _sigterm_self
+
+    assert _main(*TRAINING_ARGV["train-run"]) == 0
+
+    terminator.terminate.assert_called_once_with()
+    assert sigterm_sentinel == []
