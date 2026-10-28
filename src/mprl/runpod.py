@@ -6,6 +6,7 @@ finished or were recorded as failed.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -26,6 +27,7 @@ from mprl.negative_space import bounded, require
 RUNPOD_REST_BASE: Final[str] = "https://api.runpod.io/v2"
 
 _POD_ID_VAR = "RUNPOD_POD_ID"
+_POD_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _OK = 200
 _NO_CONTENT = 204
 _NOT_FOUND = 404
@@ -67,7 +69,7 @@ class PodTerminator:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         require(bool(api_key), "api_key must not be empty")
-        require(bool(pod_id), "pod_id must not be empty")
+        require(_POD_ID_PATTERN.fullmatch(pod_id) is not None, f"pod_id must match [A-Za-z0-9_-]+, got {pod_id!r}")
         require(max_attempts >= 1, f"max_attempts must be at least 1, got {max_attempts}")
         require(base_delay_s >= 0, f"base_delay_s must be non-negative, got {base_delay_s}")
         self._client = client
@@ -79,7 +81,16 @@ class PodTerminator:
         self._sleep = sleep
 
     def terminate(self) -> None:
-        """Delete the pod, then confirm with a read that it is gone (404 or status TERMINATED)."""
+        """Read the pod, delete it, then confirm with a read that it is gone (404 or status TERMINATED).
+
+        The pre-read makes a mis-resolved pod id loud: 404 there means we never saw the pod, so a later
+        404 would prove nothing. An already TERMINATED pod is success (idempotent) and sends no DELETE.
+        """
+        before = self._read_status()
+        if before is None:
+            raise TerminateFailed(f"pod {self._pod_id} not found — refusing to report success")
+        if before == "TERMINATED":
+            return
         deleted = self._send("DELETE")
         if deleted.status_code == _NOT_FOUND:
             # Possibly already terminated; only the read can tell.

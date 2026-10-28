@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from mprl.errors import OwnPodUnknown, TerminateFailed
+from mprl.negative_space import CheckFailed
 from mprl.runpod import RUNPOD_REST_BASE, PodTerminator, own_pod_id
 
 POD = "abc123podid"
@@ -41,9 +42,9 @@ class Script:
         return [request.method for request in self.seen]
 
 
-def _terminator(script: Script, sleeps: list[float], attempts: int = 3) -> PodTerminator:
+def _terminator(script: Script, sleeps: list[float], attempts: int = 3, pod_id: str = POD) -> PodTerminator:
     client = httpx.Client(transport=httpx.MockTransport(script))
-    return PodTerminator(client, KEY, POD, base_url=BASE, max_attempts=attempts, sleep=sleeps.append)
+    return PodTerminator(client, KEY, pod_id, base_url=BASE, max_attempts=attempts, sleep=sleeps.append)
 
 
 def _reply(status: int, text: str = "") -> httpx.Response:
@@ -82,70 +83,90 @@ def test_rest_base_is_v2() -> None:
 
 
 def test_terminate_confirms_with_read() -> None:
-    script = Script([_reply(204)], [_status("TERMINATED")])
+    script = Script([_reply(204)], [_status("RUNNING"), _status("TERMINATED")])
 
     _terminator(script, []).terminate()
 
     bearer = f"Bearer {KEY}"
     assert [(r.method, r.url.path, r.headers["authorization"]) for r in script.seen] == [
+        ("GET", f"/v2/pods/{POD}", bearer),
         ("DELETE", f"/v2/pods/{POD}", bearer),
         ("GET", f"/v2/pods/{POD}", bearer),
     ]
 
 
 def test_terminate_accepts_404_on_read() -> None:
-    script = Script([_reply(204)], [_reply(404)])
+    script = Script([_reply(204)], [_status("RUNNING"), _reply(404)])
     _terminator(script, []).terminate()
-    assert script.methods == ["DELETE", "GET"]
+    assert script.methods == ["GET", "DELETE", "GET"]
 
 
 def test_terminate_polls_until_terminated() -> None:
-    script = Script([_reply(204)], [_status("RUNNING"), _status("EXITED"), _status("TERMINATED")])
+    script = Script([_reply(204)], [_status("RUNNING"), _status("RUNNING"), _status("EXITED"), _status("TERMINATED")])
     sleeps: list[float] = []
     _terminator(script, sleeps, attempts=5).terminate()
-    assert (script.methods, sleeps) == (["DELETE", "GET", "GET", "GET"], [2.0, 4.0])
+    assert (script.methods, sleeps) == (["GET", "DELETE", "GET", "GET", "GET"], [2.0, 4.0])
 
 
 def test_terminate_retries_5xx_then_raises() -> None:
-    script = Script([_reply(503, text="upstream down")], [_reply(404)])
+    script = Script([_reply(503, text="upstream down")], [_status("RUNNING")])
     sleeps: list[float] = []
     with pytest.raises(TerminateFailed, match="503") as info:
         _terminator(script, sleeps).terminate()
 
-    assert script.methods == ["DELETE"] * 3
+    assert script.methods == ["GET", *["DELETE"] * 3]
     assert sleeps == [2.0, 4.0]
     assert KEY not in str(info.value)
 
 
 def test_terminate_retries_connection_error_then_succeeds() -> None:
-    script = Script([_refused(), _reply(204)], [_reply(429), _reply(404)])
+    script = Script([_refused(), _reply(204)], [_reply(429), _status("RUNNING"), _reply(404)])
     _terminator(script, []).terminate()
-    assert script.methods == ["DELETE", "DELETE", "GET", "GET"]
+    assert script.methods == ["GET", "GET", "DELETE", "DELETE", "GET"]
 
 
 @pytest.mark.parametrize("status", [401, 403, 409])
 def test_terminate_does_not_retry_client_errors(status: int) -> None:
-    script = Script([_reply(status, text="nope")], [_reply(404)])
+    script = Script([_reply(status, text="nope")], [_status("RUNNING")])
     with pytest.raises(TerminateFailed, match=str(status)):
         _terminator(script, []).terminate()
-    assert script.methods == ["DELETE"]
+    assert script.methods == ["GET", "DELETE"]
 
 
 def test_delete_404_succeeds_when_read_also_404() -> None:
-    script = Script([_reply(404)], [_reply(404)])
+    script = Script([_reply(404)], [_status("RUNNING"), _reply(404)])
     _terminator(script, []).terminate()
-    assert script.methods == ["DELETE", "GET"]
+    assert script.methods == ["GET", "DELETE", "GET"]
 
 
 def test_delete_404_fails_when_pod_still_exists() -> None:
-    script = Script([_reply(404)], [_status("RUNNING")])
+    script = Script([_reply(404)], [_status("RUNNING"), _status("RUNNING")])
     with pytest.raises(TerminateFailed, match="RUNNING"):
         _terminator(script, []).terminate()
-    assert script.methods == ["DELETE", "GET"]
+    assert script.methods == ["GET", "DELETE", "GET"]
 
 
 def test_never_confirmed_terminated_raises() -> None:
     script = Script([_reply(204)], [_status("RUNNING")])
     with pytest.raises(TerminateFailed, match="RUNNING"):
         _terminator(script, []).terminate()
-    assert script.methods == ["DELETE", "GET", "GET", "GET"]
+    assert script.methods == ["GET", "DELETE", "GET", "GET", "GET"]
+
+
+def test_pre_read_404_refuses_to_report_success() -> None:
+    script = Script([_reply(204)], [_reply(404)])
+    with pytest.raises(TerminateFailed, match="not found"):
+        _terminator(script, []).terminate()
+    assert script.methods == ["GET"]
+
+
+def test_pre_read_already_terminated_is_success_without_delete() -> None:
+    script = Script([_reply(204)], [_status("TERMINATED")])
+    _terminator(script, []).terminate()
+    assert script.methods == ["GET"]
+
+
+@pytest.mark.parametrize("pod_id", ["", "a/b", "../x", "a?b", "a b"])
+def test_pod_id_must_be_url_safe(pod_id: str) -> None:
+    with pytest.raises(CheckFailed, match="pod_id"):
+        _terminator(Script([_reply(204)], [_reply(404)]), [], pod_id=pod_id)

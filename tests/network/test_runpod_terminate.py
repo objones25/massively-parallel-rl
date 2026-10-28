@@ -19,10 +19,17 @@ _POD_ID = os.environ.get("MPRL_THROWAWAY_POD_ID", "")
 _API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 
 
-def _terminate_then_read() -> httpx.Response:
+def _read(client: httpx.Client) -> httpx.Response:
+    return client.get(f"{RUNPOD_REST_BASE}/pods/{_POD_ID}", headers={"Authorization": f"Bearer {_API_KEY}"})
+
+
+def _read_before_terminate_then_read() -> tuple[httpx.Response, httpx.Response]:
     with httpx.Client(timeout=30.0) as client:
+        before = _read(client)
+        if before.status_code != httpx.codes.OK or before.json()["status"] == "TERMINATED":
+            return before, before
         PodTerminator(client, _API_KEY, _POD_ID, base_url=RUNPOD_REST_BASE).terminate()
-        return client.get(f"{RUNPOD_REST_BASE}/pods/{_POD_ID}", headers={"Authorization": f"Bearer {_API_KEY}"})
+        return before, _read(client)
 
 
 @pytest.mark.skipif(
@@ -30,5 +37,8 @@ def _terminate_then_read() -> httpx.Response:
     reason="needs MPRL_THROWAWAY_POD_ID (a throwaway pod you created) and RUNPOD_API_KEY",
 )
 def test_terminate_real_pod() -> None:
-    read = _terminate_then_read()
+    before, read = _read_before_terminate_then_read()
+    # A mistyped, stale or already-terminated id would pass vacuously (404 before and after).
+    assert before.status_code == httpx.codes.OK, f"pod {_POD_ID} not found before terminating: check the id"
+    assert before.json()["status"] != "TERMINATED", f"pod {_POD_ID} was already terminated"
     assert read.status_code == httpx.codes.NOT_FOUND or read.json()["status"] == "TERMINATED"
