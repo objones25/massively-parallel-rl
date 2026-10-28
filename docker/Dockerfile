@@ -31,7 +31,7 @@ missing=()
 for pkg in "${wanted[@]}"; do
   if [[ $(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true) != "install ok installed" ]]; then missing+=("$pkg"); fi
 done
-echo "system libraries already in the base: ${wanted[*]}; missing: ${missing[*]:-none}"
+echo "system libraries wanted: ${wanted[*]}; missing from the base (installed now): ${missing[*]:-none}"
 if ((${#missing[@]} > 0)); then
   apt-get update
   apt-get install -y --no-install-recommends "${missing[@]}"
@@ -46,8 +46,10 @@ EOF
 
 # The environment lives outside /workspace (the network volume mount would hide baked files). uv uses the
 # base's Python 3.12 and never downloads another. The base sets UV_CACHE_DIR to the volume for pods; builds
-# use a cache mount instead.
+# use a cache mount instead. UV_NO_SYNC=1: `uv run` never syncs, because a plain sync would re-download the
+# 17 base packages into /opt/venv; docker/uv-sync-base.sh (here and in scripts/setup.sh) is the only sync.
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_NO_SYNC=1 \
     UV_PYTHON=/usr/bin/python3.12 \
     UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy \
@@ -74,11 +76,25 @@ RUN --mount=type=cache,target=/tmp/uv-cache UV_CACHE_DIR=/tmp/uv-cache docker/uv
 
 # Fail the build unless /opt/venv runs the base's torch 2.8.0, holds none of the base's packages, and imports
 # the training stack; and unless the pod's scripts/setup.sh sync (docker/uv-sync-base.sh) would change nothing.
+# Also unless a plain `uv run` (UV_NO_SYNC=1, no flag) imports the base's torch and leaves /opt/venv unchanged.
 # The plain `uv sync` dry run is printed only to show what it would have re-downloaded.
 RUN --mount=type=cache,target=/tmp/uv-cache <<'EOF'
 set -euo pipefail
 base_torch=$(/usr/bin/python3.12 -c 'import torch; print(torch.__file__)')
 /opt/venv/bin/python docker/verify_image.py "$base_torch"
+before=$(uv pip freeze --python /opt/venv/bin/python)
+run_torch=$(UV_CACHE_DIR=/tmp/uv-cache uv run python -c 'import torch; print(torch.__file__)')
+after=$(uv pip freeze --python /opt/venv/bin/python)
+if [[ $run_torch != "$base_torch" ]]; then
+  echo "verify: FAIL: uv run imports torch from $run_torch, not the base's $base_torch" >&2
+  exit 1
+fi
+if [[ $before != "$after" ]]; then
+  echo "verify: FAIL: uv run changed /opt/venv:" >&2
+  diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") >&2 || true
+  exit 1
+fi
+echo "verify: OK uv run imports $run_torch and changes nothing in /opt/venv"
 echo "--- plain 'uv sync --frozen --dry-run' (what setup.sh avoids):"
 UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --dry-run 2>&1 | sed 's/^/    /'
 plan=$(UV_CACHE_DIR=/tmp/uv-cache docker/uv-sync-base.sh --dry-run 2>&1)

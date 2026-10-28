@@ -17,7 +17,6 @@ concurrency:
 
 env:
   FORCE_COLOR: "1"
-  UV_FROZEN: "1"
 
 jobs:
   tests:
@@ -33,11 +32,16 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.6"
-          enable-cache: false
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: System libraries (EGL for mjlab)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libegl1 libgl1 libglib2.0-0
+      # --frozen (below) installs without checking the lock; this fails when pyproject.toml
+      # changed without a re-lock.
+      - name: Lockfile matches pyproject.toml
+        run: uv lock --check
       - name: Install
         run: uv sync --frozen
       - name: Audit test suite

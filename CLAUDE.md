@@ -84,7 +84,7 @@ uv run pytest tests/unit/test_clock.py::test_name -v # one test
 uv run pytest -m smoke -p no:randomly                # heavy tier (~2 min CPU): real mjlab/rsl_rl, training, W&B offline, ffmpeg
 uv run pytest -m smoke tests/smoke/test_render.py::test_render_rollout_cpu   # one smoke test: still needs -m smoke
 uv run pytest -m network                             # real W&B / HF / RunPod (needs keys in the environment)
-uv run pytest -m gpu                                 # CUDA tests (on the pod; skip cleanly without CUDA)
+uv run pytest -m gpu                                 # CUDA tests (on the pod, where the image's UV_NO_SYNC=1 stops uv run syncing)
 uv run pytest -p randomly -n auto                    # random order, parallel
 uv run pytest -m "not network and not gpu" --cov --cov-branch --cov-report=xml --cov-fail-under=80   # CI: fast + smoke, coverage floor
 # (the 80 % floor is for that fast + smoke run; bare `pytest --cov` on the fast tier alone falls below it)
@@ -153,11 +153,14 @@ syncs it (dev group included: the pod runs `uv run pytest -m gpu`) through `dock
 `uv sync --frozen` with `--no-install-package` for every name in `docker/base-provided-packages.txt` (torch,
 torchvision, triton, nvidia-*). `tests/unit/test_base_provided_packages.py` keeps that list equal to those
 entries of `uv.lock`; regenerate it after a re-lock if the test fails. uv ignores system site-packages when it
-decides what to install, so a plain `uv sync` into `/opt/venv` would download torch again: `scripts/setup.sh`
-therefore syncs through the same helper whenever the environment is `/opt/venv`. The build fails
-(`docker/verify_image.py` plus a dry-run sync) unless the venv imports the base's own torch 2.8.0, holds none of
-the listed packages, imports mjlab / mjlab.tasks / mujoco_warp / rsl_rl / wandb / huggingface_hub / mprl, and the
-setup.sh sync would change nothing. apt adds only those of `libegl1 libgl1 libglib2.0-0t64` the base lacks.
+decides what to install: the CI build log shows a plain `uv sync --frozen --dry-run` into `/opt/venv` "Would
+download 17 packages". So the helper is the only sync: `scripts/setup.sh` uses it whenever the environment is
+`/opt/venv`, and the image sets `UV_NO_SYNC=1` so a plain `uv run ...` on the pod (e.g. `uv run pytest -m gpu`)
+never syncs. On the pod, never run a bare `uv sync`; re-sync with `docker/uv-sync-base.sh` (or `scripts/setup.sh`).
+The build fails (`docker/verify_image.py`, a `uv run` check and a dry-run sync) unless the venv imports the base's
+own torch 2.8.0, holds none of the listed packages nor any other torch / triton / nvidia-* / cuda-* wheel, imports
+mjlab / mjlab.tasks / mujoco_warp / rsl_rl / wandb / huggingface_hub / mprl, a plain `uv run` imports the base's
+torch and changes nothing in `/opt/venv`, and the setup.sh sync would change nothing. apt adds only those of `libegl1 libgl1 libglib2.0-0t64` the base lacks.
 `MPRL_IMAGE_DIGEST` (build arg -> env) carries the git sha.
 
 Do not build the image on the Mac (10.5 GB base pull plus amd64 emulation); CI builds it natively. Local checks:
@@ -172,7 +175,8 @@ uvx --from shellcheck-py shellcheck scripts/*.sh docker/*.sh
 (DF004: root is required by RunPod's `/start.sh`. DF014: a false positive, the dependency install runs through
 `docker/uv-sync-base.sh` before `COPY . .`.)
 
-**CI** (GitHub Actions, actions pinned by commit SHA): `tests.yml` runs the audits, ruff, pyright, shellcheck and
+**CI** (GitHub Actions, actions pinned by commit SHA): `tests.yml` runs `uv lock --check` (pyproject edited without a
+re-lock fails; the installs use `--frozen`), the audits, ruff, pyright, shellcheck and
 `uv run pytest -m "not network and not gpu" --cov --cov-branch --cov-fail-under=80` (fast + smoke with the
 coverage floor; the local default run is fast-only and has no floor). `image.yml` (pushes to `main` and
 `feat/**`) calls tests.yml via `workflow_call`, then builds and pushes `ghcr.io/objones25/massively-parallel-rl`

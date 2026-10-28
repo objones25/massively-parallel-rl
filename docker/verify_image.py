@@ -20,6 +20,8 @@ TORCH_VERSION = "2.8.0"
 TORCHVISION_VERSION = "0.23.0"
 STACK = ("mjlab", "mjlab.tasks", "mujoco", "mujoco_warp", "warp", "rsl_rl", "wandb", "huggingface_hub", "mprl")
 LIST_FILE = Path(__file__).resolve().parent / "base-provided-packages.txt"
+# Any torch / CUDA wheel in the venv shadows the base, even one a future lock adds outside the list.
+CUDA_LIKE = re.compile(r"^(torch|torchvision|torchaudio|triton)$|^(nvidia|cuda)-")  # not torchrunx (mjlab dep)
 
 
 def fail(message: str) -> None:
@@ -58,7 +60,7 @@ def main(argv: list[str]) -> None:
 
     venv_site = Path(sysconfig.get_paths()["purelib"])
     in_venv = {normalize(d.metadata["Name"]) for d in importlib.metadata.distributions(path=[str(venv_site)])}
-    duplicated = sorted(in_venv & base_provided())
+    duplicated = sorted((in_venv & base_provided()) | {name for name in in_venv if CUDA_LIKE.match(name)})
     if duplicated:
         fail(f"base-provided packages were installed into {venv_site}: {duplicated}")
 
