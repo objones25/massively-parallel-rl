@@ -1,0 +1,166 @@
+[project]
+name = "mprl"
+version = "0.1.0"
+description = "Massively parallel RL: Unitree G1 walking on mjlab at many parallel env counts."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mjlab==1.6.0",
+    # Listed directly so [tool.uv.sources] below can route it per platform.
+    "torch>=2.7.0",
+    "huggingface_hub",
+    "httpx",
+    "imageio[ffmpeg]",
+    "pillow",
+    "matplotlib",
+    "tyro",
+    "python-dotenv",
+]
+
+[project.scripts]
+mprl = "mprl.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "pytest-randomly",
+    "pytest-xdist",
+    "ruff",
+    "pyright",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mprl"]
+
+# --- torch wheels --------------------------------------------------------
+# Linux (the A100 pod) takes the CUDA 12.6 build; macOS keeps the default PyPI
+# (CPU/MPS) wheel. cu126 is chosen over cu130 because it needs the oldest NVIDIA
+# driver (12.x minor-version compatibility) and still ships torch 2.14.1, the same
+# version macOS resolves. cu128 stops at torch 2.11, so it is not used. The Linux
+# CUDA wheel also runs on CPU-only machines, which is how the Docker CPU matrix works.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# --- pytest (merged from pytest-expert assets/pytest-config.toml) ---------
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+strict = true
+addopts = [
+    "--import-mode=importlib",
+    "-ra",
+    "--showlocals",
+    "--tb=short",
+    "--cov",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=xml",
+    "--cov-fail-under=80",
+    "-m", "not network and not gpu",
+]
+markers = [
+    "smoke: real libraries (mjlab, rsl_rl) on CPU; runs by default",
+    "network: real W&B / Hugging Face / RunPod calls; needs keys; deselected by default",
+    "gpu: requires CUDA; deselected by default",
+]
+# Warnings are errors, except three third-party deprecations emitted by mjlab 1.6.0 itself
+# (not our code): torch.jit.script at import (mjlab/utils/lab_api/math.py), and the legacy
+# TorchScript ONNX exporter used by MjlabOnPolicyRunner.save (mjlab/rl/runner.py).
+# Remove each once mjlab stops triggering it.
+filterwarnings = [
+    "error",
+    "ignore:`torch.jit.script` is deprecated:FutureWarning",
+    "ignore:You are using the legacy TorchScript-based ONNX export:DeprecationWarning",
+    "ignore:The feature will be removed. Please remove usage of this function:DeprecationWarning:torch.onnx",
+]
+faulthandler_timeout = 300
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+# negative_space.py is a verbatim vendored copy, tested upstream in the skill.
+omit = ["*/tests/*", "*/__main__.py", "*/_version.py", "*/mprl/negative_space.py"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "\\.\\.\\.",
+]
+
+[tool.coverage.paths]
+source = ["src", "*/site-packages"]
+
+# --- ruff (merged from pytest-expert assets/ruff-pytest.toml) -------------
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["mutants"]
+
+[tool.ruff.lint]
+select = ["PT", "B", "S", "SIM", "RUF", "E", "F", "I", "UP", "ARG", "DTZ", "PGH004"]
+ignore = ["PT001", "PT023", "E501"]
+
+[tool.ruff.lint.flake8-pytest-style]
+parametrize-names-type = "tuple"
+parametrize-values-type = "list"
+parametrize-values-row-type = "tuple"
+raises-require-match-for = ["BaseException", "Exception", "ValueError", "OSError", "IOError", "socket.error"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**/*.py" = ["S101", "S311", "ARG001", "SIM105"]
+"**/test_*.py" = ["S101", "S311", "ARG001", "SIM105"]
+"**/conftest.py" = ["S101", "S311", "ARG001"]
+"**/scripts/*.py" = ["S603", "S607"]
+# Verbatim skill copy; its Python 3.10 fallback and noqa comments are intentional.
+"scripts/audit_negative_space.py" = ["UP035", "RUF100"]
+# negative_space.py is a verbatim copy of the skill asset; do not reformat it.
+"src/mprl/negative_space.py" = ["N818", "UP", "RUF", "SIM", "E", "I"]
+
+# --- pyright --------------------------------------------------------------
+# Strict on our own code (src/mprl). Relaxed, because mjlab / rsl_rl / warp / mujoco are
+# only partially typed and strict mode would flag every call into them rather than
+# our mistakes:
+#   reportMissingTypeStubs, reportUnknown{Member,Variable,Argument,Parameter}Type,
+#   reportMissingModuleSource, reportUntypedFunctionDecorator are downgraded to "none".
+# Everything else stays at strict (unused imports, optional access, missing annotations
+# on our functions, incompatible overrides, ...). Tighten these as the libraries gain types.
+[tool.pyright]
+include = ["src/mprl"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportMissingModuleSource = "none"
+reportUntypedFunctionDecorator = "none"

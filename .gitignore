@@ -12,3 +12,4 @@ wandb/
 .DS_Store
 # Reference PDFs stay local (large; one is the user's own survey).
 *.pdf
+coverage.xml

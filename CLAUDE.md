@@ -73,8 +73,40 @@ Reference material in the repo root:
 
 ## Commands
 
-*TBD — fill in once the project is scaffolded (setup script, train script, how to run the full
-test suite, a single test, lint, type check, and the negative-space / test audits).*
+Python 3.12, uv only (never pip). The torch wheel is CUDA 12.6 on Linux and the default PyPI wheel on macOS (`[tool.uv.sources]`).
+
+```
+uv sync                                              # install (also installs the dev group)
+uv run pytest                                        # default suite: smoke + unit; network and gpu deselected
+uv run pytest tests/unit/test_clock.py::test_name -v # one test
+uv run pytest -m network                             # real W&B / HF / RunPod (needs keys in the environment)
+uv run pytest -m gpu                                 # CUDA tests (on the pod)
+uv run pytest -p randomly -n auto                    # random order, parallel
+uv run pytest tests/smoke -v --no-cov                # real-library pinning tests (mjlab, CPU)
+
+uv run python scripts/audit_tests.py tests/          # must print "clean: no findings"
+uv run python scripts/audit_negative_space.py src/ --select NSP002,NSP003,NSP005,NSP006,NSP007   # must exit 0
+uv run ruff check .                                  # lint (PT, bandit, bugbear, ...)
+uv run pyright src                                   # strict on src/mprl; third-party unknown-type reports relaxed (see pyproject)
+```
+
+Setup script, train script and the `mprl` CLI are not written yet; document them here when they exist.
+
+## Where tests run
+
+`tests/smoke/test_mjlab_cpu.py` pins mjlab 1.6.0 / rsl_rl 5.4.2 behavior on CPU with 4 envs. Verified 2026-10-27:
+
+| Test | macOS arm64 (CPU) | Linux x86_64 (CPU, `python:3.12` under `--platform linux/amd64`) |
+|---|---|---|
+| `test_g1_flat_env_steps_on_cpu` | pass | pass |
+| `test_g1_runner_trains_two_iterations_on_cpu` | pass | pass |
+| `test_fresh_runner_restores_iteration_and_step_counter` | pass | pass |
+| `test_play_env_renders_rgb_frame` | pass | pass |
+
+Nothing failed on both CPUs, so no smoke test needs to move to `gpu` yet. Linux needs system libraries
+before `import mjlab.tasks` works: `libegl1 libgl1 libglib2.0-0` (the plain `python:3.12` image fails at
+import with `AttributeError: 'NoneType' object has no attribute 'eglQueryString'` from PyOpenGL). The
+Dockerfile must install them. Unit tests need no system libraries beyond the venv.
 
 ## Architecture
 
