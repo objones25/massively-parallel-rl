@@ -1064,6 +1064,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "huggingface-hub" },
     { name = "imageio", extra = ["ffmpeg"] },
     { name = "matplotlib" },
@@ -1089,6 +1090,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "huggingface-hub" },
     { name = "imageio", extras = ["ffmpeg"] },
     { name = "matplotlib" },

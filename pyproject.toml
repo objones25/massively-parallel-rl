@@ -10,6 +10,8 @@ dependencies = [
     "torch>=2.7.0",
     "huggingface_hub",
     "httpx",
+    # Hugging Face's HTTP client; mprl.hub catches its connection errors (httpx2.TransportError).
+    "httpx2",
     "imageio[ffmpeg]",
     "pillow",
     "matplotlib",
