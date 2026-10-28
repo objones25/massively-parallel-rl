@@ -1,4 +1,4 @@
-"""Smoke test: render a real 2-iteration G1 checkpoint on CPU."""
+"""Smoke test: render the shared real 2-iteration G1 checkpoint (``g1_checkpoint``) on CPU."""
 
 from __future__ import annotations
 
@@ -7,29 +7,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from mprl.checkpoints import CheckpointRef, CheckpointStore
-from mprl.clock import TrainingClock, cuda_sync_for
-from mprl.config import RunSpec
-from mprl.negative_space import CheckFailed, expect
+from mprl.checkpoints import CheckpointRef
+from mprl.negative_space import CheckFailed
 from mprl.render import render_rollout
-from mprl.train import built_runner
 
 pytestmark = pytest.mark.smoke
 
-LONG_S = 3600.0
 STEP_DT_S = 0.02  # decimation 4 x timestep 0.005 s
 
 
-@pytest.fixture(scope="module")
-def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> CheckpointRef:
-    root = tmp_path_factory.mktemp("render")
-    spec = RunSpec("rendertest", 4, 0, LONG_S / 60.0, LONG_S / 60.0)
-    store = CheckpointStore(root / "checkpoints")
-    with built_runner(spec, "cpu", "tensorboard", root / "logs") as runner:
-        runner.learn_for(
-            TrainingClock(sync=cuda_sync_for("cpu")), LONG_S, LONG_S, store, fresh_start=True, max_iterations=2
-        )
-    return expect(store.latest(), "the 2-iteration run saved no checkpoint")
+@pytest.fixture
+def checkpoint(g1_checkpoint: CheckpointRef) -> CheckpointRef:
+    return g1_checkpoint
 
 
 def test_render_rollout_cpu(checkpoint: CheckpointRef):

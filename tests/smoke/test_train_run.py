@@ -1,107 +1,62 @@
-"""Smoke tests for train_run / finish_and_terminate against real mjlab on CPU with 4 envs and W&B offline.
+"""Smoke tests for train_run against real mjlab on CPU with 4 envs and W&B offline.
 
 One G1 flat iteration at 4 envs is about 0.5 s of training clock on this Mac, so budgets of 2-4 s run a
 handful of iterations. Checkpoints every 1 s of training clock (1/60 min).
+
+Real training runs only where it is the behavior: the fresh run (the session ``completed_run_template``),
+a raised budget, the SIGKILL resume and the two post-training failures. Every other path starts from a
+copy of the completed run (``completed_run``). The skip, upload-retry, W&B id, staging-error and
+config-mismatch decisions are unit-tested on hand-built run directories (tests/unit/test_train_run.py).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
-import httpx
-import httpx2
 import pytest
 import wandb
 from huggingface_hub import HfApi
-from huggingface_hub.errors import HfHubHTTPError
-from huggingface_hub.utils import hf_raise_for_status
+from support import EVERY_MIN, CompletedRun, run_spec, runpod_terminator
 
-import mprl.publish as publish_mod
 import mprl.train as train_mod
 from mprl.checkpoints import CheckpointStore
 from mprl.config import RunSpec
-from mprl.errors import ConfigMismatch
 from mprl.hub import HubPublisher
 from mprl.negative_space import expect
 from mprl.paths import RunPaths
 from mprl.publish import finish_and_terminate
 from mprl.run_state import RunState, load_state, save_state
-from mprl.runpod import PodTerminator
 from mprl.timed_runner import TimedOnPolicyRunner
 from mprl.train import TrainDeps, resolve_cfgs, train_run, wandb_logger_cfg
 from mprl.wandb_writer import ResumableWandbWriter
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.usefixtures("offline_wandb")]
 
-EVERY_S = 1.0 / 60.0  # checkpoint every 1 s of training clock
 DEPS = TrainDeps(publisher=None, wandb_mode="offline", device="cpu")
 REPO = "someone/mprl-test"
-POD = "abc123podid"
 SRC_DIR = Path(train_mod.__file__).resolve().parents[1]
 KILL_DEADLINE_S = 180.0  # mjlab import + env build + first checkpoint, generously
+POLL_S = 0.2
 
 
-def _spec(budget_s: float, *, every_minutes: float = EVERY_S, num_envs: int = 4, seed: int = 0) -> RunSpec:
-    return RunSpec("main", num_envs, seed, budget_s / 60.0, every_minutes)
-
-
-@pytest.fixture(autouse=True)
-def _offline_wandb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """wandb reads WANDB_DIR once per service; restart it so each test sees its own tmp_path."""
-    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
-    wandb.teardown()
-    yield
-    wandb.teardown()
-
-
-def _http_error(status: int) -> HfHubHTTPError:
-    request = httpx2.Request("POST", f"https://huggingface.co/api/models/{REPO}/commit/main")
-    try:
-        hf_raise_for_status(httpx2.Response(status, request=request))
-    except HfHubHTTPError as error:
-        return error
-    raise AssertionError(f"status {status} did not raise")
-
-
-def _wait_for_first_checkpoint(child: subprocess.Popen[bytes], store: CheckpointStore) -> None:
-    """Poll the volume until the child saved a checkpoint; fail if the child exits first."""
-    deadline = time.monotonic() + KILL_DEADLINE_S
-    while store.latest() is None and time.monotonic() < deadline:
+def _wait_for_first_checkpoint(child: Any, store: CheckpointStore) -> None:
+    """Poll the volume until the child saved a checkpoint; fail if the child exits first (bounded)."""
+    for _ in range(int(KILL_DEADLINE_S / POLL_S)):
+        if store.latest() is not None:
+            return
         try:
-            code = child.wait(timeout=0.2)  # the bounded wait between polls
-        except subprocess.TimeoutExpired:
+            code = child.wait(timeout=POLL_S)  # the bounded wait between polls
+        except subprocess.TimeoutExpired:  # still training
             continue
         raise AssertionError(f"train_run child exited with {code} before its first checkpoint")
-
-
-def _runpod_handler(paths: RunPaths, events: list[tuple[str, object]]) -> Callable[[httpx.Request], httpx.Response]:
-    """A RunPod pod that is RUNNING until DELETE (which records the on-disk uploads), then 404."""
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.method == "DELETE":
-            on_disk = expect(load_state(paths.state_file), "no state.json at DELETE time")
-            events.append(("DELETE", on_disk.uploads))
-            return httpx.Response(204)
-        if any(name == "DELETE" for name, _ in events):
-            return httpx.Response(404)
-        return httpx.Response(200, json={"id": POD, "status": "RUNNING"})
-
-    return handle
-
-
-def _terminator(paths: RunPaths, events: list[tuple[str, object]]) -> PodTerminator:
-    transport = httpx.MockTransport(_runpod_handler(paths, events))
-    return PodTerminator(httpx.Client(transport=transport), "key", POD, base_url="https://api.test/v2")
 
 
 def _flatten(value: object, prefix: str = "") -> dict[str, object]:
@@ -123,11 +78,10 @@ def _diff(a: dict[str, Any], b: dict[str, Any]) -> set[str]:
     return {key for key in fa.keys() | fb.keys() if fa.get(key, "<missing>") != fb.get(key, "<missing>")}
 
 
-def test_fresh_run_completes_and_writes_state(tmp_path: Path) -> None:
-    spec = _spec(2.0)
-    paths = RunPaths(tmp_path, spec)
-
-    state = train_run(spec, tmp_path, DEPS)
+def test_fresh_run_completes_and_writes_state(completed_run_template: CompletedRun) -> None:
+    spec = run_spec(2.0)
+    paths = RunPaths(completed_run_template.volume, spec)
+    state = completed_run_template.state
 
     assert state.status == "complete"
     assert state.run_id == spec.run_id
@@ -135,53 +89,52 @@ def test_fresh_run_completes_and_writes_state(tmp_path: Path) -> None:
     assert state.train_seconds >= 2.0
     assert state.budget_minutes == spec.budget_minutes
     assert state.uploads == {}
-    assert state.git_sha != ""
+    assert state.git_sha == train_mod.git_sha()
     assert load_state(paths.state_file) == state
     refs = CheckpointStore(paths.checkpoints_dir).list()
     assert len(refs) >= 2
     assert (paths.checkpoints_dir / "checkpoints.onnx").is_file()
     assert {p.name for p in (paths.run_dir / "params").iterdir()} == {"env.yaml", "agent.yaml"}
-    assert len(list((tmp_path / "wandb").glob(f"offline-run-*-{state.wandb_run_id}"))) == 1
+    offline_runs = list((completed_run_template.wandb_dir / "wandb").glob(f"offline-run-*-{state.wandb_run_id}"))
+    assert len(offline_runs) == 1
 
 
-def test_completed_run_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    spec = _spec(2.0)
-    first = train_run(spec, tmp_path, DEPS)
-    before = CheckpointStore(RunPaths(tmp_path, spec).checkpoints_dir).list()
-
-    def no_env(*args: object, **kwargs: object) -> None:
-        raise AssertionError("a completed run built an environment")
-
-    monkeypatch.setattr(train_mod, "ManagerBasedRlEnv", no_env)
-    started = time.monotonic()
-    second = train_run(spec, tmp_path, DEPS)
-
-    assert time.monotonic() - started < 1.0
-    assert second == first
-    assert CheckpointStore(RunPaths(tmp_path, spec).checkpoints_dir).list() == before
-
-
-def test_raised_budget_continues(tmp_path: Path) -> None:
-    first = train_run(_spec(2.0), tmp_path, DEPS)
-    store = CheckpointStore(RunPaths(tmp_path, _spec(2.0)).checkpoints_dir)
+def test_raised_budget_continues(completed_run: CompletedRun) -> None:
+    store = CheckpointStore(RunPaths(completed_run.volume, run_spec(2.0)).checkpoints_dir)
     first_refs = store.list()
 
-    second = train_run(_spec(4.0), tmp_path, DEPS)
+    second = train_run(run_spec(4.0), completed_run.volume, DEPS)
 
     refs = store.list()
     assert second.status == "complete"
     assert second.train_seconds >= 4.0
     assert second.budget_minutes == pytest.approx(4.0 / 60.0)
-    assert second.wandb_run_id == first.wandb_run_id
-    assert first_refs[0] in refs
+    assert second.wandb_run_id == completed_run.state.wandb_run_id
     assert set(first_refs) < set(refs)
     assert min(r.iteration for r in refs if r not in first_refs) > first_refs[-1].iteration
     iterations = [r.iteration for r in refs]
     assert len(iterations) == len(set(iterations))
 
 
-def test_resume_after_kill_continues_clock(tmp_path: Path) -> None:
-    long_spec = _spec(600.0)  # never finishes on its own; killed after the first checkpoint
+def test_crash_after_final_checkpoint_completes_without_training(completed_run: CompletedRun) -> None:
+    spec = run_spec(2.0)
+    paths = RunPaths(completed_run.volume, spec)
+    first = completed_run.state
+    refs = CheckpointStore(paths.checkpoints_dir).list()
+    (paths.checkpoints_dir / "checkpoints.onnx").unlink()
+    save_state(paths.state_file, RunState(**{**asdict(first), "status": "running"}))  # died before "complete"
+
+    state = train_run(spec, completed_run.volume, DEPS)
+
+    assert state.status == "complete"
+    assert state.train_seconds == first.train_seconds
+    assert state.uploads == {}
+    assert CheckpointStore(paths.checkpoints_dir).list() == refs
+    assert (paths.checkpoints_dir / "checkpoints.onnx").is_file()  # re-exported from the loaded checkpoint
+
+
+def test_resume_after_kill_continues_clock(tmp_path: Path, subprocesses: Any) -> None:
+    long_spec = run_spec(600.0)  # never finishes on its own; killed after the first checkpoint
     paths = RunPaths(tmp_path, long_spec)
     store = CheckpointStore(paths.checkpoints_dir)
     code = (
@@ -189,26 +142,24 @@ def test_resume_after_kill_continues_clock(tmp_path: Path) -> None:
         "from pathlib import Path\n"
         "from mprl.config import RunSpec\n"
         "from mprl.train import TrainDeps, train_run\n"
-        f"train_run(RunSpec('main', 4, 0, {long_spec.budget_minutes!r}, {EVERY_S!r}), Path(sys.argv[1]),"
-        " TrainDeps(None, 'offline', 'cpu'))\n"
+        f"train_run(RunSpec('main', 4, 0, {long_spec.budget_minutes!r}, {EVERY_MIN!r}), Path(sys.argv[1]),"
+        " TrainDeps(None, 'disabled', 'cpu'))\n"
     )
-    env = {**os.environ, "PYTHONPATH": str(SRC_DIR), "WANDB_DIR": str(tmp_path)}
+    # HOME stays the real one: Warp caches its compiled kernels under it (a fresh HOME recompiles them all).
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "PYTHONPATH": str(SRC_DIR), "WANDB_MODE": "disabled"}
     with (tmp_path / "child.log").open("w") as log:
-        child = subprocess.Popen(  # noqa: S603  fixed interpreter and code
-            [sys.executable, "-c", code, str(tmp_path)], env=env, stdout=log, stderr=subprocess.STDOUT
-        )
+        child = subprocesses.spawn([sys.executable, "-c", code, str(tmp_path)], env=env, stdout=log)
         try:
             _wait_for_first_checkpoint(child, store)
         finally:
-            child.send_signal(signal.SIGKILL)
-            child.wait(timeout=30)
+            subprocesses.kill_group(child)  # SIGKILL: no handler, no cleanup, like a pod losing power
     killed_at = expect(store.latest(), f"no checkpoint within {KILL_DEADLINE_S} s; see {tmp_path / 'child.log'}")
     stored = expect(load_state(paths.state_file), "the child wrote no state.json")
     assert stored.status == "running"
     partial = paths.checkpoints_dir / ".model_it9999999_s999999.pt.tmp"
     partial.write_bytes(b"truncated torch payload")
 
-    resumed_spec = _spec(killed_at.train_seconds + 2.0)
+    resumed_spec = run_spec(killed_at.train_seconds + 2.0)
     state = train_run(resumed_spec, tmp_path, DEPS)
 
     refs = store.list()
@@ -223,52 +174,12 @@ def test_resume_after_kill_continues_clock(tmp_path: Path) -> None:
     assert len({r.iteration for r in refs}) == len(refs)
 
 
-def test_resume_refuses_config_mismatch(tmp_path: Path) -> None:
-    started = _spec(2.0, every_minutes=EVERY_S)
-    changed = _spec(2.0, every_minutes=2 * EVERY_S)  # same run id, different config
-    save_state(
-        RunPaths(tmp_path, started).state_file,
-        RunState(started.run_id, started.config_hash(), "wid", "running", 1.0, started.budget_minutes, "sha", {}),
-    )
-
-    with pytest.raises(ConfigMismatch, match="main-n00004-s0"):
-        train_run(changed, tmp_path, DEPS)
-
-
-def test_run_without_checkpoint_mints_new_wandb_id(tmp_path: Path) -> None:
-    """A crash before the first checkpoint must not continue the crashed W&B run (its steps restart at 0)."""
-    spec = _spec(2.0)
-    save_state(
-        RunPaths(tmp_path, spec).state_file,
-        RunState(spec.run_id, spec.config_hash(), "crashed0", "running", 0.0, spec.budget_minutes, "sha", {}),
-    )
-
-    state = train_run(spec, tmp_path, DEPS)
-
-    assert state.status == "complete"
-    assert state.wandb_run_id != "crashed0"
-
-
-def test_crash_after_final_checkpoint_completes_without_training(tmp_path: Path) -> None:
-    spec = _spec(2.0)
-    paths = RunPaths(tmp_path, spec)
-    first = train_run(spec, tmp_path, DEPS)
-    refs = CheckpointStore(paths.checkpoints_dir).list()
-    save_state(paths.state_file, RunState(**{**asdict(first), "status": "running"}))  # died before "complete"
-
-    state = train_run(spec, tmp_path, DEPS)
-
-    assert state.status == "complete"
-    assert state.train_seconds == first.train_seconds
-    assert CheckpointStore(paths.checkpoints_dir).list() == refs
-
-
 def test_onnx_export_failure_is_recorded_not_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def broken_export(self: TimedOnPolicyRunner, path: str, filename: str = "policy.onnx") -> None:
         raise RuntimeError("onnx exporter exploded")
 
     monkeypatch.setattr(TimedOnPolicyRunner, "export_policy_to_onnx", broken_export)
-    spec = _spec(2.0)
+    spec = run_spec(2.0)
 
     state = train_run(spec, tmp_path, DEPS)
 
@@ -279,107 +190,13 @@ def test_onnx_export_failure_is_recorded_not_raised(tmp_path: Path, monkeypatch:
     assert load_state(RunPaths(tmp_path, spec).state_file) == state
 
 
-@pytest.mark.parametrize(
-    ("status", "recorded"),
-    [(503, "UploadFailed"), (403, "HfHubHTTPError")],
-)
-def test_terminate_runs_after_failed_upload(tmp_path: Path, status: int, recorded: str) -> None:
-    spec = _spec(2.0)
-    paths = RunPaths(tmp_path, spec)
-    events: list[tuple[str, object]] = []
-    api = create_autospec(HfApi, instance=True)
-
-    def failing_upload(**kwargs: Any) -> None:
-        events.append(("upload", sorted(p.name for p in Path(kwargs["folder_path"]).rglob("*") if p.is_file())))
-        raise _http_error(status)
-
-    api.upload_folder.side_effect = failing_upload
-    publisher = HubPublisher(api, REPO, max_attempts=2, sleep=lambda _s: None)
-
-    terminator = _terminator(paths, events)
-
-    state = train_run(spec, tmp_path, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
-    finish_and_terminate([state], terminator)
-
-    path_in_repo = f"runs/main/{spec.run_id}"
-    final = expect(CheckpointStore(paths.checkpoints_dir).latest(), "no checkpoint")
-    uploaded = {final.path.name, "checkpoints.onnx", "env.yaml", "agent.yaml", "state.json"}
-    upload_events = [files for name, files in events if name == "upload"]
-    assert upload_events
-    assert all(set(files) == uploaded for files in upload_events)  # type: ignore[arg-type]
-    assert events[-1][0] == "DELETE"
-    assert [name for name, _ in events].count("DELETE") == 1
-    assert state.uploads[path_in_repo].startswith(f"{recorded}:")
-    assert str(status) in state.uploads[path_in_repo]
-    assert events[-1][1] == state.uploads  # the failure was durable on disk before the DELETE
-    assert final.path.is_file()
-    assert api.upload_folder.call_args.kwargs["path_in_repo"] == path_in_repo
-    assert not (paths.run_dir / "upload").exists()  # staging removed after the failed attempt
-
-
-def _working_publisher() -> tuple[HubPublisher, Any]:
-    api = create_autospec(HfApi, instance=True)
-    api.upload_folder.return_value.commit_url = f"https://huggingface.co/{REPO}/commit/abc"
-    return HubPublisher(api, REPO, max_attempts=1, sleep=lambda _s: None), api
-
-
-def test_terminate_runs_after_staging_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A full volume while staging the upload is recorded in state.json, and the DELETE still follows."""
-    spec = _spec(2.0)
-    paths = RunPaths(tmp_path, spec)
-    events: list[tuple[str, object]] = []
-    publisher, api = _working_publisher()
-
-    def no_space(*args: object, **kwargs: object) -> None:
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(publish_mod.shutil, "copy2", no_space)
-    state = train_run(spec, tmp_path, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
-    finish_and_terminate([state], _terminator(paths, events))
-
-    recorded = state.uploads[f"runs/main/{spec.run_id}"]
-    assert recorded.startswith("OSError:")
-    assert "No space left on device" in recorded
-    assert [name for name, _ in events] == ["DELETE"]
-    assert events[0][1] == state.uploads  # durable on disk before the DELETE
-    assert api.upload_folder.call_count == 0
-    assert not (paths.run_dir / "upload").exists()
-
-
-def test_failed_upload_is_retried_without_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    spec = _spec(2.0)
-    paths = RunPaths(tmp_path, spec)
-    failing_api = create_autospec(HfApi, instance=True)
-    failing_api.upload_folder.side_effect = _http_error(503)
-    failing = HubPublisher(failing_api, REPO, max_attempts=1, sleep=lambda _s: None)
-    first = train_run(spec, tmp_path, TrainDeps(publisher=failing, wandb_mode="offline", device="cpu"))
-    path_in_repo = f"runs/main/{spec.run_id}"
-    assert first.uploads[path_in_repo].startswith("UploadFailed:")
-    before = CheckpointStore(paths.checkpoints_dir).list()
-
-    def no_env(*args: object, **kwargs: object) -> None:
-        raise AssertionError("an upload retry built an environment")
-
-    monkeypatch.setattr(train_mod, "ManagerBasedRlEnv", no_env)
-    publisher, api = _working_publisher()
-    second = train_run(spec, tmp_path, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
-
-    assert api.upload_folder.call_count == 1
-    assert api.upload_folder.call_args.kwargs["path_in_repo"] == path_in_repo
-    assert second.uploads[path_in_repo] == "ok"
-    assert load_state(paths.state_file) == second
-    assert second.train_seconds == first.train_seconds
-    assert CheckpointStore(paths.checkpoints_dir).list() == before
-    assert not (paths.run_dir / "upload").exists()
-
-
 def test_writer_stop_failure_still_exports_onnx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def stop_then_fail(self: ResumableWandbWriter) -> None:
         wandb.finish()
         raise RuntimeError("wandb down")
 
     monkeypatch.setattr(ResumableWandbWriter, "stop", stop_then_fail)
-    spec = _spec(2.0)
+    spec = run_spec(2.0)
     paths = RunPaths(tmp_path, spec)
 
     state = train_run(spec, tmp_path, DEPS)
@@ -392,6 +209,35 @@ def test_writer_stop_failure_still_exports_onnx(tmp_path: Path, monkeypatch: pyt
     assert onnx.is_file()
     assert onnx.stat().st_mtime >= final.path.stat().st_mtime
     assert load_state(paths.state_file) == state
+
+
+def test_failed_upload_of_real_run_files_is_durable_before_terminate(
+    completed_run: CompletedRun, hub_http_error: Callable[[int], Exception]
+) -> None:
+    """The files a real run leaves (checkpoint, mjlab's ONNX name, params, state) are staged; DELETE is last."""
+    spec = run_spec(2.0)
+    paths = RunPaths(completed_run.volume, spec)
+    events: list[tuple[str, object]] = []
+    api = create_autospec(HfApi, instance=True)
+
+    def failing_upload(**kwargs: Any) -> None:
+        events.append(("upload", sorted(p.name for p in Path(kwargs["folder_path"]).rglob("*") if p.is_file())))
+        raise hub_http_error(503)
+
+    api.upload_folder.side_effect = failing_upload
+    publisher = HubPublisher(api, REPO, max_attempts=1, sleep=lambda _s: None)
+
+    # complete without an "ok" upload: train_run only retries the upload (pinned in tests/unit/test_train_run.py)
+    state = train_run(spec, completed_run.volume, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
+    finish_and_terminate([state], runpod_terminator(paths, events))
+
+    final = expect(CheckpointStore(paths.checkpoints_dir).latest(), "no checkpoint")
+    path_in_repo = f"runs/main/{spec.run_id}"
+    assert events[0] == ("upload", sorted({final.path.name, "checkpoints.onnx", "env.yaml", "agent.yaml", "state.json"}))
+    assert [name for name, _ in events] == ["upload", "DELETE"]
+    assert state.uploads[path_in_repo].startswith("UploadFailed:")
+    assert events[-1][1] == state.uploads  # the failure was durable on disk before the DELETE
+    assert not (paths.run_dir / "upload").exists()
 
 
 def test_only_num_envs_and_seed_differ_between_sweep_runs() -> None:

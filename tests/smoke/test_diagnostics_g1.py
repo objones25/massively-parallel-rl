@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from rsl_rl.utils.log_writer import LogWriter
+from support import LONG_S, make_env_runner
 
 from mprl.checkpoints import CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
@@ -34,20 +36,26 @@ def _module_tree(runner: Any) -> dict[str, list[str]]:
     }
 
 
-@pytest.fixture
-def g1_scalars(build: Any, store: CheckpointStore) -> tuple[dict[tuple[str, int], float], dict[str, list[str]]]:
-    """Run 2 real G1 iterations with every_k=1; return {(key, step): value} and the module tree."""
-    _, runner = build(logger={"class_name": ScalarRecorder})
-    tree = _module_tree(runner)
-    diag, on_before_update, on_iteration = for_runner(runner, every_k=1)
-    diag.attach()
-    clock = TrainingClock(sync=cuda_sync_for("cpu"))
-    runner.learn_for(
-        clock, 3600.0, 3600.0, store, fresh_start=True, max_iterations=2,
-        on_before_update=on_before_update, on_iteration=on_iteration,
-    )  # fmt: skip
-    diag.detach()
-    return {(k, step): v for k, v, step in runner.logger.writer.scalars}, tree
+@pytest.fixture(scope="module")
+def g1_scalars(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[dict[tuple[str, int], float], dict[str, list[str]]]]:
+    """Run 2 real G1 iterations with every_k=1, once per module; yield {(key, step): value} and the module tree."""
+    root = tmp_path_factory.mktemp("diag")
+    env, runner = make_env_runner(root / "logs", logger={"class_name": ScalarRecorder})
+    try:
+        tree = _module_tree(runner)
+        diag, on_before_update, on_iteration = for_runner(runner, every_k=1)
+        diag.attach()
+        clock = TrainingClock(sync=cuda_sync_for("cpu"))
+        runner.learn_for(
+            clock, LONG_S, LONG_S, CheckpointStore(root / "checkpoints"), fresh_start=True, max_iterations=2,
+            on_before_update=on_before_update, on_iteration=on_iteration,
+        )  # fmt: skip
+        diag.detach()
+        yield {(k, step): v for k, v, step in runner.logger.writer.scalars}, tree
+    finally:
+        env.close()
 
 
 @pytest.mark.parametrize("module", ["actor", "critic"])

@@ -1,4 +1,7 @@
-"""Smoke test for mprl.throughput.measure_throughput against real mjlab on CPU.
+"""Unit tests for mprl.throughput.measure_throughput's bookkeeping, with ``measure_count`` doubled.
+
+The real measurement and the timed evaluation on a throughput checkpoint are pinned end to end by
+tests/smoke/test_cli.py::test_throughput_writes_measurements_with_timed_eval.
 
 ``torch.OutOfMemoryError`` is the class CUDA raises (verified in torch 2.14.1:
 ``torch.cuda.OutOfMemoryError is torch.OutOfMemoryError``, a ``RuntimeError`` subclass).
@@ -15,19 +18,20 @@ import torch
 
 import mprl.throughput as throughput_mod
 from mprl.evaluator import EvalConfig
-from mprl.throughput import measure_eval_seconds, measure_throughput
-
-pytestmark = pytest.mark.smoke
+from mprl.throughput import CountMeasurement, measure_eval_seconds, measure_throughput
 
 
 def test_oom_count_recorded_not_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def oom(num_envs: int, *args: Any, **kwargs: Any) -> Any:
+    def fits(num_envs: int, *args: Any, **kwargs: Any) -> CountMeasurement:
+        return CountMeasurement(steps_per_second=1234.0, io_overhead_fraction=0.05)
+
+    def oom(num_envs: int, *args: Any, **kwargs: Any) -> CountMeasurement:
         raise torch.OutOfMemoryError(f"CUDA out of memory at num_envs={num_envs}. Tried to allocate 2.00 GiB")
 
-    behaviors = iter([throughput_mod.measure_count, oom])  # the real measurement for 4, OOM for 8
+    behaviors = iter([fits, oom])  # a measurement for 4, OOM for 8
     seen: list[int] = []
 
-    def measure(num_envs: int, *args: Any, **kwargs: Any) -> Any:
+    def measure(num_envs: int, *args: Any, **kwargs: Any) -> CountMeasurement:
         seen.append(num_envs)
         return next(behaviors)(num_envs, *args, **kwargs)
 
@@ -36,9 +40,8 @@ def test_oom_count_recorded_not_raised(tmp_path: Path, monkeypatch: pytest.Monke
     m = measure_throughput((4, 8), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=1.5)
 
     assert m.fits == {4: True, 8: False}
-    assert m.steps_per_second[4] > 0
-    assert 8 not in m.steps_per_second
-    assert m.io_overhead_fraction > 0
+    assert m.steps_per_second == {4: pytest.approx(1234.0)}
+    assert m.io_overhead_fraction == pytest.approx(0.05)
     assert m.eval_seconds_per_checkpoint == pytest.approx(1.5)
     assert seen == [4, 8]
 
@@ -75,14 +78,6 @@ def test_memory_released_after_oom_frame_is_gone(tmp_path: Path, monkeypatch: py
 
     assert m.fits == {4: False, 8: False}
     assert alive_at_release == [False, False]
-
-
-def test_eval_seconds_timed_on_a_throughput_checkpoint(tmp_path: Path) -> None:
-    measure_throughput((4,), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
-
-    seconds = measure_eval_seconds(tmp_path, 4, "cpu", EvalConfig(envs_per_command=1, seeds=(0,), horizon_s=0.1))
-
-    assert 0.0 < seconds < 600.0
 
 
 def test_eval_seconds_needs_a_checkpoint(tmp_path: Path) -> None:

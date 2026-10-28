@@ -7,13 +7,14 @@ Exception classes observed against the real Hub / huggingface_hub 2.3.0 (httpx2 
 - A refused connection (`HfApi(endpoint="http://127.0.0.1:1")`) raised `httpx2.ConnectError`
   (a `httpx2.NetworkError` / `httpx2.TransportError`), unwrapped.
 
-A live 5xx or 429 cannot be provoked on demand, so `_http_error` builds one the way the library does:
+A live 5xx or 429 cannot be provoked on demand, so the `hub_http_error` fixture (tests/conftest.py) builds one the way the library does:
 `hf_raise_for_status(httpx2.Response(status, request=httpx2.Request(...)))`, which yields the same
 `HfHubHTTPError` class and `.response.status_code` a server reply would.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import create_autospec
 
@@ -21,22 +22,12 @@ import httpx2
 import pytest
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
-from huggingface_hub.utils import hf_raise_for_status
 
 from mprl.errors import UploadFailed
 from mprl.hub import HubPublisher
 
 REPO = "someone/mprl-test"
 COMMIT_URL = "https://huggingface.co/someone/mprl-test/commit/abc123"
-
-
-def _http_error(status: int) -> HfHubHTTPError:
-    request = httpx2.Request("POST", f"https://huggingface.co/api/models/{REPO}/commit/main")
-    try:
-        hf_raise_for_status(httpx2.Response(status, request=request))
-    except HfHubHTTPError as error:
-        return error
-    raise AssertionError(f"status {status} did not raise")
 
 
 def _publisher(api: HfApi, sleeps: list[float], **kwargs: float) -> HubPublisher:
@@ -50,8 +41,8 @@ def api() -> HfApi:
     return mock
 
 
-def test_retries_then_succeeds(api: HfApi, tmp_path: Path) -> None:
-    api.upload_folder.side_effect = [_http_error(503), _http_error(503), api.upload_folder.return_value]  # type: ignore[attr-defined]
+def test_retries_then_succeeds(api: HfApi, tmp_path: Path, hub_http_error: Callable[[int], Exception]) -> None:
+    api.upload_folder.side_effect = [hub_http_error(503), hub_http_error(503), api.upload_folder.return_value]  # type: ignore[attr-defined]
     sleeps: list[float] = []
 
     url = _publisher(api, sleeps).upload_folder(tmp_path, "ckpt", "msg")
@@ -61,8 +52,8 @@ def test_retries_then_succeeds(api: HfApi, tmp_path: Path) -> None:
     assert api.upload_folder.call_count == 3  # type: ignore[attr-defined]
 
 
-def test_retries_then_raises_upload_failed(api: HfApi, tmp_path: Path) -> None:
-    api.upload_folder.side_effect = _http_error(503)  # type: ignore[attr-defined]
+def test_retries_then_raises_upload_failed(api: HfApi, tmp_path: Path, hub_http_error: Callable[[int], Exception]) -> None:
+    api.upload_folder.side_effect = hub_http_error(503)  # type: ignore[attr-defined]
     sleeps: list[float] = []
 
     with pytest.raises(UploadFailed) as raised:
@@ -73,8 +64,8 @@ def test_retries_then_raises_upload_failed(api: HfApi, tmp_path: Path) -> None:
     assert isinstance(raised.value.__cause__, HfHubHTTPError)
 
 
-def test_client_error_not_retried(api: HfApi, tmp_path: Path) -> None:
-    api.upload_folder.side_effect = _http_error(401)  # type: ignore[attr-defined]
+def test_client_error_not_retried(api: HfApi, tmp_path: Path, hub_http_error: Callable[[int], Exception]) -> None:
+    api.upload_folder.side_effect = hub_http_error(401)  # type: ignore[attr-defined]
     sleeps: list[float] = []
 
     with pytest.raises(HfHubHTTPError):
@@ -84,8 +75,8 @@ def test_client_error_not_retried(api: HfApi, tmp_path: Path) -> None:
     assert sleeps == []
 
 
-def test_rate_limit_is_retried(api: HfApi, tmp_path: Path) -> None:
-    api.upload_folder.side_effect = [_http_error(429), api.upload_folder.return_value]  # type: ignore[attr-defined]
+def test_rate_limit_is_retried(api: HfApi, tmp_path: Path, hub_http_error: Callable[[int], Exception]) -> None:
+    api.upload_folder.side_effect = [hub_http_error(429), api.upload_folder.return_value]  # type: ignore[attr-defined]
     sleeps: list[float] = []
 
     assert _publisher(api, sleeps).upload_folder(tmp_path, "ckpt", "msg") == COMMIT_URL

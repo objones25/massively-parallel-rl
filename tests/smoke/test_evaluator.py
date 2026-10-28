@@ -1,6 +1,7 @@
 """Smoke tests for the fixed-command evaluator against real mjlab / rsl_rl on CPU.
 
-Checkpoints come from real 2-iteration training runs at 4 and 8 envs (session-scoped, built once). The
+Checkpoints come from real 2-iteration training runs at 4 envs (the shared session ``g1_checkpoint``) and
+at 8 envs (here, for the one test whose variable is the training num_envs). The
 horizon is kept short (0.3 s = 15 control steps at step_dt 0.02 s) and two envs per command, so each
 evaluation steps 12 envs for 15 steps per seed.
 """
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommandCfg
+from support import LONG_S
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
@@ -23,7 +25,6 @@ from mprl.train import built_runner
 
 pytestmark = pytest.mark.smoke
 
-LONG_S = 3600.0  # a budget / checkpoint interval the 2-iteration runs never reach
 CFG = EvalConfig(envs_per_command=2, horizon_s=0.3)
 FALL_CFG = EvalConfig(envs_per_command=2, horizon_s=2.5)
 HORIZON_STEPS = 15  # 0.3 s / step_dt 0.02 s (decimation 4 x timestep 0.005 s)
@@ -39,9 +40,9 @@ def _train_two_iterations(root: Path, num_envs: int) -> CheckpointRef:
     return expect(store.latest(), "the 2-iteration run saved no checkpoint")
 
 
-@pytest.fixture(scope="session")
-def checkpoint_4(tmp_path_factory: pytest.TempPathFactory) -> CheckpointRef:
-    return _train_two_iterations(tmp_path_factory.mktemp("n4"), 4)
+@pytest.fixture
+def checkpoint_4(g1_checkpoint: CheckpointRef) -> CheckpointRef:
+    return g1_checkpoint
 
 
 @pytest.fixture(scope="session")

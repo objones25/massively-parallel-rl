@@ -1,29 +1,31 @@
-"""Smoke test: build_results end to end on a tiny real sweep (G1 flat, CPU, W&B offline, no publisher).
+"""Smoke test: build_results end to end on a tiny sweep (G1 flat, CPU, W&B offline, no publisher).
 
-Four runs (4 and 8 envs x seeds 0 and 1) train for 6 s of training clock each with a checkpoint every
-3 s (0.1 / 0.05 min). Evaluation is one env per command for 0.2 s and one seed; the race clips are
-0.1 s at 64 x 96 so the whole test stays around a minute and a half.
+Training is not the behavior here, so the four runs (4 and 8 envs x seeds 0 and 1, a 6 s budget with a
+checkpoint every 3 s: 0.1 / 0.05 min) are laid out from copies of the shared real ``g1_checkpoint``,
+saved through ``CheckpointStore`` at 3 s and 6 s of training clock, the stamps a real run leaves at the
+two marks. Everything build_results does is real: evaluation of all 8 checkpoints (one env per command
+for 0.2 s, one seed), the curves, the race clips (0.1 s at 64 x 96) and the video encode.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+import shutil
 from pathlib import Path
 from typing import Any
 
 import imageio.v2 as imageio
 import pytest
-import wandb
 
 import mprl.results as results_mod
+from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.config import SweepSpec
 from mprl.evaluator import EvalConfig, read_eval_csv
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.results import build_results
-from mprl.train import TrainDeps, train_run
+from mprl.run_state import RunState, save_state
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.usefixtures("offline_wandb")]
 
 SWEEP = SweepSpec(
     "smoke", env_counts=(4, 8), seeds=(0, 1), budget_minutes=0.1, checkpoint_every_minutes=0.05, eval_every_minutes=0.05
@@ -32,20 +34,23 @@ EVAL = EvalConfig(seeds=(0,), envs_per_command=1, horizon_s=0.2)
 SMALL: dict[str, Any] = {"eval_cfg": EVAL, "render_seconds": 0.1, "render_size": (64, 96)}
 
 
-@pytest.fixture(autouse=True)
-def _offline_wandb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """wandb reads WANDB_DIR once per service; restart it so the test sees its own tmp_path."""
-    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
-    wandb.teardown()
-    yield
-    wandb.teardown()
+CHECKPOINTS = ((1, 3.0), (3, 6.0))  # (iteration, training-clock s): one crossing each mark
 
 
-def test_build_results_end_to_end_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    root = tmp_path / "volume"
-    deps = TrainDeps(publisher=None, wandb_mode="offline", device="cpu")
+def _lay_out_sweep(root: Path, weights: CheckpointRef) -> None:
+    """Every run of SWEEP as a completed run whose checkpoints hold ``weights``' real parameters."""
     for spec in SWEEP.runs():
-        train_run(spec, root, deps)
+        paths = RunPaths(root, spec)
+        store = CheckpointStore(paths.checkpoints_dir)
+        for iteration, seconds in CHECKPOINTS:
+            store.save_atomic(lambda path: shutil.copyfile(weights.path, path), iteration, seconds)
+        state = RunState(spec.run_id, spec.config_hash(), f"{spec.run_id}-w", "complete", 6.0, 0.1, "sha", {})
+        save_state(paths.state_file, state)
+
+
+def test_build_results_end_to_end_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, g1_checkpoint: CheckpointRef):
+    root = tmp_path / "volume"
+    _lay_out_sweep(root, g1_checkpoint)
 
     out = build_results(
         SWEEP, root, primary_metric="vel_error_xy", publisher=None, wandb_mode="offline", device="cpu", **SMALL

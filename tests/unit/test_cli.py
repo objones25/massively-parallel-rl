@@ -6,6 +6,7 @@ the terminator is an autospecced ``PodTerminator``. ``main`` runs in-process wit
 
 from __future__ import annotations
 
+import importlib.metadata
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
@@ -265,6 +266,7 @@ def test_train_run_refuses_before_training_without_pod_id(
     assert code == 1
     train.assert_not_called()
     assert "--no-terminate" in capsys.readouterr().err
+    assert not root.exists()  # refused before anything touched the volume
 
 
 def test_train_run_refuses_without_api_key(
@@ -322,3 +324,50 @@ def test_cli_metric_choices_match_the_curves_metrics() -> None:
     from mprl.curves import METRICS
 
     assert set(cli.METRIC_CHOICES) == set(METRICS)
+
+
+SUBCOMMANDS = ("setup", "preflight", "throughput", "train-run", "pilot", "sweep", "results")
+
+
+def test_help_lists_every_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit, match=r"^0$"):
+        cli.main(["--help"])
+
+    out = capsys.readouterr().out
+    assert [name for name in SUBCOMMANDS if name not in out] == []
+    assert tuple(cli.COMMANDS) == SUBCOMMANDS
+
+
+def test_console_script_is_cli_main() -> None:
+    (script,) = importlib.metadata.entry_points(group="console_scripts", name="mprl")
+
+    assert script.value == "mprl.cli:main"
+
+
+def test_preflight_exits_nonzero_on_a_failed_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MPRL_VOLUME_ROOT", str(tmp_path))
+    monkeypatch.setenv("MPRL_ENV_FILE", str(tmp_path / "no.env"))
+
+    code = cli.main(["preflight", "--cpu", "--only", "wandb"])
+
+    assert code == 1
+    assert "FAIL wandb: MissingSecret: WANDB_API_KEY is not set" in capsys.readouterr().out
+
+
+def test_env_file_override_is_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = tmp_path / "custom.env"
+    env_file.write_text(f"MPRL_VOLUME_ROOT={tmp_path / 'from-env-file'}\n")
+    monkeypatch.setenv("MPRL_ENV_FILE", str(env_file))
+    # load_dotenv writes os.environ directly; registering the key with monkeypatch makes teardown remove it.
+    monkeypatch.setenv("MPRL_VOLUME_ROOT", "unset-below")
+    monkeypatch.delenv("MPRL_VOLUME_ROOT")
+
+    code = cli.main(["preflight", "--cpu", "--only", "volume"])
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert f"{tmp_path / 'from-env-file'} is writable" in out

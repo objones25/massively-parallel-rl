@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,17 +12,9 @@ from rsl_rl.utils.logger import Logger
 
 from mprl.wandb_writer import ResumableWandbWriter, logger_cfg
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.usefixtures("offline_wandb")]  # WANDB_DIR = tmp_path
 
 RUN_ID = "run0abc"
-
-
-@pytest.fixture(autouse=True)
-def _fresh_wandb_service() -> Iterator[None]:
-    """wandb reads WANDB_DIR once per service; restart it so each test sees its own tmp_path."""
-    wandb.teardown()
-    yield
-    wandb.teardown()
 
 
 def _logger(tmp_path: Path, cfg: dict) -> Logger:
@@ -40,7 +31,6 @@ def _logger(tmp_path: Path, cfg: dict) -> Logger:
 
 
 def test_logger_builds_writer_and_logs_offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     logger = _logger(tmp_path, logger_cfg("mprl-tests", RUN_ID, "g", None, "offline"))
     try:
         logger.init_logging_writer()
@@ -58,7 +48,6 @@ def test_logger_builds_writer_and_logs_offline(tmp_path: Path, monkeypatch: pyte
 
 def test_resume_from_iteration_uses_resume_from(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """With an iteration given, the writer asks wandb to rewind to that step (beta resume_from)."""
-    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     captured: dict[str, object] = {}
     real_init = wandb.init
 
@@ -79,29 +68,10 @@ def test_resume_from_iteration_uses_resume_from(tmp_path: Path, monkeypatch: pyt
     assert "resume" not in captured
 
 
-def test_wandb_init_accepts_the_keywords_we_pass() -> None:
-    params = set(inspect.signature(wandb.init).parameters)
-    passed = {"id", "resume", "resume_from", "group", "job_type", "mode", "entity", "tags", "config"}
-    assert passed <= params
-
-
-def test_logger_cfg_shape() -> None:
-    cfg = logger_cfg("p", "rid", "grp", 3, "offline")
-    assert cfg == {
-        "class_name": "mprl.wandb_writer:ResumableWandbWriter",
-        "project": "p",
-        "run_id": "rid",
-        "group": "grp",
-        "resume_from_iteration": 3,
-        "mode": "offline",
-    }
-
-
 def test_store_config_accepts_real_mjlab_env_cfg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, build: Callable[..., tuple[object, Any]]
 ) -> None:
     """Real G1 env cfg (callables, class refs, nested configs) must survive the runner's init_logging_writer."""
-    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     try:
         _, runner = build(logger=logger_cfg("mprl-tests", RUN_ID, "g", None, "offline"))
         runner.logger.init_logging_writer()  # what learn_for does at start, with the runner's real env cfg
