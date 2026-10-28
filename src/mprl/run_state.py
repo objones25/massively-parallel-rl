@@ -49,15 +49,20 @@ def load_state(path: Path) -> RunState | None:
 
 
 def save_state(path: Path, state: RunState) -> None:
+    write_json_atomic(path, asdict(state))
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    """Write ``data`` as JSON through a same-directory temp file, fsync and ``os.replace``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     try:
         with tmp.open("w") as f:
-            json.dump(asdict(state), f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    require(path.is_file(), f"state file {path} missing after replace")
+    require(path.is_file(), f"{path} missing after replace")

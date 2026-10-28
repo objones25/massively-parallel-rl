@@ -1,0 +1,265 @@
+"""Unit tests for mprl.sweep with an autospecced ``train_run`` (its real behavior is pinned by
+tests/smoke/test_train_run.py) and an autospecced ``PodTerminator``."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, create_autospec
+
+import pytest
+
+import mprl.sweep as sweep_mod
+import mprl.train
+from mprl.budget import CostEstimate, Measurements
+from mprl.config import RunSpec, SweepSpec
+from mprl.errors import EnvDoesNotFit
+from mprl.paths import RunPaths, sweep_results_dir
+from mprl.run_state import RunState, save_state
+from mprl.runpod import PodTerminator
+from mprl.sweep import pilot_spec, run_sweep
+from mprl.train import TrainDeps
+
+SHA = "a" * 40
+DEPS = TrainDeps(publisher=None, wandb_mode="disabled", device="cpu")
+SMALL = SweepSpec("main", env_counts=(64, 4096), seeds=(0, 1))
+
+
+def _m(io: float = 0.0) -> Measurements:
+    return Measurements(0.0, io, {64: True, 4096: True}, {64: 900.0, 4096: 250_000.0})
+
+
+def _state(spec: RunSpec, *, train_seconds: float | None = None, sha: str = SHA, **overrides: Any) -> RunState:
+    seconds = spec.budget_minutes * 60.0 if train_seconds is None else train_seconds
+    fields: dict[str, Any] = {
+        "run_id": spec.run_id,
+        "config_hash": spec.config_hash(),
+        "wandb_run_id": f"{spec.run_id}-w",
+        "status": "complete",
+        "train_seconds": seconds,
+        "budget_minutes": spec.budget_minutes,
+        "git_sha": sha,
+        "uploads": {},
+    } | overrides
+    return RunState(**fields)
+
+
+@pytest.fixture
+def train_run(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    double = create_autospec(mprl.train.train_run)
+    double.side_effect = lambda spec, *_: _state(spec)
+    monkeypatch.setattr(sweep_mod, "train_run", double)
+    monkeypatch.setattr(sweep_mod, "git_sha", lambda: SHA)
+    return double
+
+
+@pytest.fixture
+def terminator() -> MagicMock:
+    return create_autospec(PodTerminator, instance=True)
+
+
+def _trained(train_run: MagicMock) -> list[str]:
+    return [call.args[0].run_id for call in train_run.call_args_list]
+
+
+def _yes(est: CostEstimate, cuts: tuple[str, ...]) -> bool:
+    return True
+
+
+def test_sweep_runs_every_run_then_the_long_run_and_terminates(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock
+) -> None:
+    states = run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=terminator, reuse_pilot=False)
+
+    expected = [r.run_id for r in SMALL.runs()] + [SMALL.long_run().run_id]
+    assert _trained(train_run) == expected
+    assert [s.run_id for s in states] == expected
+    assert all(call.args[1:] == (tmp_path, DEPS) for call in train_run.call_args_list)
+    terminator.terminate.assert_called_once_with()
+
+
+def test_sweep_excludes_counts_that_do_not_fit(tmp_path: Path, train_run: MagicMock) -> None:
+    sweep = SweepSpec("main")
+    m = Measurements(0.0, 0.0, {64: True, 256: True, 1024: True, 4096: True, 16384: False}, {64: 900.0, 4096: 2.5e5})
+
+    run_sweep(sweep, tmp_path, DEPS, m, confirm=_yes, terminator=None, reuse_pilot=False)
+
+    trained = [call.args[0] for call in train_run.call_args_list]
+    assert {s.num_envs for s in trained} == {64, 256, 1024, 4096}
+    assert len(trained) == 4 * 3 + 1
+    manifest = json.loads((sweep_results_dir(tmp_path, "main") / "sweep_manifest.json").read_text())
+    reason = manifest["excluded"]["16384"]
+    assert "16384" in reason
+    assert "out of memory" in reason
+    assert "4096: 250000" in reason  # the measured steps/s that do fit are cited
+    assert manifest["planned"]["env_counts"] == [64, 256, 1024, 4096]
+    assert manifest["git_sha"] == SHA
+
+
+def test_sweep_refuses_when_64_does_not_fit(tmp_path: Path, train_run: MagicMock) -> None:
+    with pytest.raises(EnvDoesNotFit, match="64"):
+        run_sweep(
+            SMALL,
+            tmp_path,
+            DEPS,
+            Measurements(0.0, 0.0, {64: False, 4096: True}, {4096: 250_000.0}),
+            confirm=_yes,
+            terminator=None,
+            reuse_pilot=False,
+        )
+    train_run.assert_not_called()
+
+
+def test_sweep_requires_confirmation_when_cuts_applied(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[tuple[CostEstimate, tuple[str, ...]]] = []
+
+    def refuse(est: CostEstimate, cuts: tuple[str, ...]) -> bool:
+        seen.append((est, cuts))
+        return False
+
+    states = run_sweep(
+        SweepSpec("main"), tmp_path, DEPS, _m(io=0.4), confirm=refuse, terminator=terminator, reuse_pilot=False
+    )
+
+    assert states == []
+    train_run.assert_not_called()
+    terminator.terminate.assert_not_called()
+    assert len(seen) == 1
+    assert seen[0][1] == ("eval_every_6min", "long_run_half")
+    assert seen[0][0].total_usd <= 40.0
+    assert "$" in capsys.readouterr().out  # the estimate is printed
+
+
+def test_sweep_does_not_ask_without_cuts(tmp_path: Path, train_run: MagicMock) -> None:
+    def never(est: CostEstimate, cuts: tuple[str, ...]) -> bool:
+        raise AssertionError("confirm called although no cut applies")
+
+    states = run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=never, terminator=None, reuse_pilot=False)
+
+    assert len(states) == len(SMALL.runs()) + 1
+
+
+def test_sweep_terminates_pod_on_crash(tmp_path: Path, train_run: MagicMock, terminator: MagicMock) -> None:
+    train_run.side_effect = [_state(SMALL.runs()[0]), RuntimeError("simulator exploded")]
+
+    with pytest.raises(RuntimeError, match="simulator exploded"):
+        run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=terminator, reuse_pilot=False)
+
+    assert train_run.call_count == 2
+    terminator.terminate.assert_called_once_with()
+
+
+def _write_pilot(root: Path, state: RunState) -> Path:
+    paths = RunPaths(root, pilot_spec(SMALL))
+    save_state(paths.state_file, state)
+    return paths.run_dir
+
+
+def _reused_id() -> str:
+    return RunSpec("main", 4096, 0, 45.0).run_id
+
+
+@pytest.mark.parametrize(
+    ("label", "pilot_state", "reused"),
+    [
+        ("match", _state(pilot_spec(SMALL)), True),
+        ("other code", _state(pilot_spec(SMALL), sha="b" * 40), False),
+        ("other config", _state(replace(pilot_spec(SMALL), checkpoint_every_minutes=1.5)), False),
+        ("unfinished", _state(pilot_spec(SMALL), status="running"), False),
+        ("short", _state(pilot_spec(SMALL), train_seconds=44.0 * 60), False),
+    ],
+)
+def test_pilot_reused_only_when_hash_and_sha_match(
+    tmp_path: Path, train_run: MagicMock, label: str, pilot_state: RunState, reused: bool
+) -> None:
+    _write_pilot(tmp_path, pilot_state)
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    assert (_reused_id() not in _trained(train_run)) is reused, label
+    assert (sweep_results_dir(tmp_path, "main") / "pilot_reuse.json").is_file() is reused, label
+    assert _trained(train_run)[-1] == SMALL.long_run().run_id  # the long run resumes the pilot either way
+
+
+def test_pilot_reuse_manifest_names_source_and_cap(tmp_path: Path, train_run: MagicMock) -> None:
+    pilot_dir = _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    manifest = json.loads((sweep_results_dir(tmp_path, "main") / "pilot_reuse.json").read_text())
+    assert manifest == {
+        _reused_id(): {
+            "source_run_dir": str(pilot_dir),
+            "max_minutes": pytest.approx(45.0),
+            "git_sha": SHA,
+            "config_hash": pilot_spec(SMALL).config_hash(),
+        }
+    }
+
+
+def test_pilot_not_reused_without_flag(tmp_path: Path, train_run: MagicMock) -> None:
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=False)
+
+    assert _reused_id() in _trained(train_run)
+    assert not (sweep_results_dir(tmp_path, "main") / "pilot_reuse.json").exists()
+
+
+def test_pilot_not_reused_when_head_unknown(
+    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL), sha="unknown"))
+    monkeypatch.setattr(sweep_mod, "git_sha", lambda: "unknown")
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    assert _reused_id() in _trained(train_run)
+
+
+def test_pilot_not_reused_when_sweep_started_on_other_code(tmp_path: Path, train_run: MagicMock) -> None:
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+    manifest = sweep_results_dir(tmp_path, "main") / "sweep_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"git_sha": "c" * 40}))
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    assert _reused_id() in _trained(train_run)
+
+
+def test_recorded_pilot_reuse_survives_long_run_resuming(tmp_path: Path, train_run: MagicMock) -> None:
+    """After a crash during the long run the pilot is 'running' past 45 min; the recorded reuse still holds."""
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+    _write_pilot(
+        tmp_path, _state(replace(pilot_spec(SMALL), budget_minutes=180.0), status="running", train_seconds=6000.0)
+    )
+    train_run.reset_mock()
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    assert _reused_id() not in _trained(train_run)
+
+
+def test_pilot_spec_is_the_first_45_minutes_of_the_long_run() -> None:
+    spec = pilot_spec(SMALL)
+
+    assert spec.run_id == SMALL.long_run().run_id
+    assert spec.budget_minutes == pytest.approx(45.0)
+    assert spec.config_hash() == SMALL.long_run().config_hash()
+    assert replace(spec, sweep="main").config_hash() == RunSpec("main", 4096, 0, 45.0).config_hash()
+
+
+def test_run_pilot_trains_the_pilot_spec_then_terminates(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock
+) -> None:
+    state = sweep_mod.run_pilot(SMALL, tmp_path, DEPS, terminator=terminator)
+
+    train_run.assert_called_once_with(pilot_spec(SMALL), tmp_path, DEPS)
+    assert state.run_id == SMALL.long_run().run_id
+    terminator.terminate.assert_called_once_with()

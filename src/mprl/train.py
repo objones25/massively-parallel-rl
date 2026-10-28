@@ -24,7 +24,8 @@ import os
 import shutil
 import subprocess
 import uuid
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -115,7 +116,7 @@ def wandb_logger_cfg(
     return cfg
 
 
-def resolve_cfgs(spec: RunSpec, logger: dict[str, Any]) -> tuple[ManagerBasedRlEnvCfg, dict[str, Any]]:
+def resolve_cfgs(spec: RunSpec, logger: dict[str, Any] | str) -> tuple[ManagerBasedRlEnvCfg, dict[str, Any]]:
     """The shipped task configs with only ``num_envs``, the seeds and the logger set.
 
     Seeds as ``mjlab/scripts/train.py`` does on one device: ``agent.seed = env.seed = seed``; the env's
@@ -129,6 +130,28 @@ def resolve_cfgs(spec: RunSpec, logger: dict[str, Any]) -> tuple[ManagerBasedRlE
     agent_cfg = asdict(rl_cfg)
     agent_cfg["logger"] = logger
     return env_cfg, agent_cfg
+
+
+@contextmanager
+def built_runner(
+    spec: RunSpec, device: str, logger: dict[str, Any] | str, log_dir: Path, *, params_dir: Path | None = None
+) -> Generator[TimedOnPolicyRunner]:
+    """The real env (``resolve_cfgs``) wrapped in a fresh ``TimedOnPolicyRunner``; the env is closed on exit.
+
+    With ``params_dir`` the env and agent configs are dumped there before the runner exists, as mjlab
+    does: the runner mutates ``agent_cfg`` in place.
+    """
+    env_cfg, agent_cfg = resolve_cfgs(spec, logger)
+    configure_torch_backends()  # as mjlab's train script
+    env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    try:
+        if params_dir is not None:
+            dump_yaml(params_dir / "env.yaml", asdict(env_cfg))
+            dump_yaml(params_dir / "agent.yaml", agent_cfg)
+        wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg["clip_actions"])
+        yield TimedOnPolicyRunner(wrapped, agent_cfg, str(log_dir), device)
+    finally:
+        env.close()
 
 
 def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:
@@ -196,15 +219,7 @@ def _train(
 ) -> tuple[CheckpointRef, float, dict[str, str]]:
     """Build env + fresh runner, resume from ``latest``, train to the budget: (final ref, clock s, errors)."""
     budget_s = spec.budget_minutes * 60.0
-    env_cfg, agent_cfg = resolve_cfgs(spec, logger)
-    configure_torch_backends()  # as mjlab's train script
-    env = ManagerBasedRlEnv(cfg=env_cfg, device=deps.device)
-    try:
-        # Written before the runner exists, as mjlab does: the runner mutates agent_cfg in place.
-        dump_yaml(paths.run_dir / "params" / "env.yaml", asdict(env_cfg))
-        dump_yaml(paths.run_dir / "params" / "agent.yaml", agent_cfg)
-        wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg["clip_actions"])
-        runner = TimedOnPolicyRunner(wrapped, agent_cfg, str(paths.tensorboard_dir), deps.device)
+    with built_runner(spec, deps.device, logger, paths.tensorboard_dir, params_dir=paths.run_dir / "params") as runner:
         sync = cuda_sync_for(deps.device)
         if latest is None:
             clock = TrainingClock(sync=sync)
@@ -216,8 +231,6 @@ def _train(
             onnx_error = export_onnx(runner, latest)
             return latest, clock.elapsed_s, {} if onnx_error is None else {_ONNX_KEY: onnx_error}
         return _learn(spec, paths, deps, runner, clock, budget_s, fresh_start=latest is None)
-    finally:
-        env.close()
 
 
 def _learn(
