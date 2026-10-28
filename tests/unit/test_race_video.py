@@ -8,7 +8,15 @@ import pytest
 
 from mprl.checkpoints import CheckpointStore
 from mprl.negative_space import CheckFailed
-from mprl.race_video import BANNER_HEIGHT, Panel, compose_frame, race_timeline, starting_panel, write_video
+from mprl.race_video import (
+    BANNER_HEIGHT,
+    Panel,
+    compose_frame,
+    race_frames,
+    race_timeline,
+    starting_panel,
+    write_video,
+)
 
 H, W = 360, 480
 
@@ -83,7 +91,9 @@ def test_timeline_picks_checkpoint_at_or_before_mark(tmp_path: Path):
     stores = {64: _store(tmp_path, "a", [3, 6, 9]), 256: _store(tmp_path, "b", [3, 6, 9, 12])}
     timeline = race_timeline(stores, [6.0, 10.0, 12.0])
     assert [mark for mark, _ in timeline] == [6.0, 10.0, 12.0]
-    picked = {mark: {n: ref.train_seconds / 60.0 if ref else None for n, ref in refs.items()} for mark, refs in timeline}
+    picked = {
+        mark: {n: ref.train_seconds / 60.0 if ref else None for n, ref in refs.items()} for mark, refs in timeline
+    }
     assert picked == {6.0: {64: 6.0, 256: 6.0}, 10.0: {64: 9.0, 256: 9.0}, 12.0: {64: 9.0, 256: 12.0}}
 
 
@@ -113,3 +123,20 @@ def test_write_video_round_trip(tmp_path: Path):
 def test_write_video_rejects_empty(tmp_path: Path):
     with pytest.raises(CheckFailed):
         write_video(iter(()), tmp_path / "x.mp4", fps=5)
+
+
+def test_race_frames_render_each_checkpoint_once(tmp_path: Path):
+    store = _store(tmp_path, "n64", [3.0])  # one checkpoint, shown at both later marks
+    timeline = race_timeline({64: store, 256: _store(tmp_path, "n256", [])}, [0.0, 3.0, 6.0])
+    rendered: list[Path] = []
+
+    def render(ref):
+        rendered.append(ref.path)
+        return _solid(200, frames=3)
+
+    frames = list(race_frames(timeline, {64: "64", 256: "256"}, 6.0, render, frames_per_mark=4, size=(H, W), columns=3))
+
+    assert len(frames) == 3 * 4
+    assert rendered == [store.list()[0].path]
+    assert frames[0][BANNER_HEIGHT + H // 2, W // 2].tolist() != [200, 200, 200]  # "starting" before 3 min
+    assert frames[-1][BANNER_HEIGHT + H // 2, W // 2].tolist() == [200, 200, 200]

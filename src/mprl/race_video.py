@@ -5,7 +5,7 @@ Pure numpy / Pillow / imageio; no simulator. Frames come from ``mprl.render.rend
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -90,6 +90,40 @@ def race_timeline(
     """
     require(len(checkpoints) > 0, "need at least one env count")
     return [(float(mark), {n: store.at_or_before(mark) for n, store in checkpoints.items()}) for mark in marks_minutes]
+
+
+def _clock(minutes: float) -> str:
+    seconds = round(minutes * 60.0)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def race_frames(
+    timeline: Sequence[tuple[float, Mapping[int, CheckpointRef | None]]],
+    labels: Mapping[int, str],
+    budget_minutes: float,
+    render: Callable[[CheckpointRef], np.ndarray],
+    *,
+    frames_per_mark: int,
+    size: tuple[int, int],
+    columns: int,
+) -> Iterator[np.ndarray]:
+    """Composed frames, mark by mark. Each checkpoint is rendered once and kept only while shown."""
+    shown: dict[Path, np.ndarray] = {}
+    for mark, refs in timeline:
+        current = {ref.path for ref in refs.values() if ref is not None}
+        shown = {path: clip for path, clip in shown.items() if path in current}
+        panels: list[Panel] = []
+        for n, label in labels.items():
+            ref = refs[n]
+            if ref is None:
+                panels.append(starting_panel(label, height=size[0], width=size[1]))
+                continue
+            if ref.path not in shown:
+                shown[ref.path] = render(ref)
+            panels.append(Panel(label, shown[ref.path]))
+        banner = f"Training clock {_clock(mark)} / {_clock(budget_minutes)}"
+        for index in range(frames_per_mark):
+            yield compose_frame(panels, banner, columns=columns, index=index)
 
 
 def write_video(frames: Iterable[np.ndarray], path: Path, fps: int) -> None:

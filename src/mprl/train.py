@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _REPO_DIR = Path(__file__).resolve().parents[2]
-_DEFAULT_WANDB_PROJECT = "mprl-humanoid-walk"  # .env.example default (plan, Task 14)
+DEFAULT_WANDB_PROJECT = "mprl-humanoid-walk"  # .env.example default (plan, Task 14)
 _ONNX_KEY = "onnx"  # state.uploads keys for errors that are not uploads
 _POST_TRAINING_KEY = "post_training"
 
@@ -108,7 +108,7 @@ def wandb_logger_cfg(
     if environ.get("MPRL_IMAGE_DIGEST"):
         extra["image_digest"] = environ["MPRL_IMAGE_DIGEST"]
     cfg = logger_cfg(
-        environ.get("WANDB_PROJECT", _DEFAULT_WANDB_PROJECT), wandb_run_id, spec.sweep, resume_from_iteration, mode
+        environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT), wandb_run_id, spec.sweep, resume_from_iteration, mode
     )
     cfg["extra_config"] = extra
     if environ.get("WANDB_ENTITY"):
