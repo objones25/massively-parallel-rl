@@ -322,7 +322,9 @@ class PpoHealth:
         stride = -(-n // self._max_samples)  # ceil: at most max_samples rows
         rows = torch.arange(0, n, stride, device=st.actions.device)
         require(0 < rows.numel() <= self._max_samples, f"{rows.numel()} rows kept, bound {self._max_samples}")
-        observations = st.observations.select(*self._actor.obs_groups).flatten(0, 1)
+        # tensordict 0.14's TensorDict.flatten has no return annotation and an in-place branch that returns None;
+        # the out-of-place call always returns a TensorDict.
+        observations = expect(st.observations.select(*self._actor.obs_groups).flatten(0, 1), "flattened observations")
         self._snapshot = _RolloutSnapshot(  # advanced indexing copies: later storage writes do not reach it
             observations=observations[rows],
             actions=st.actions.flatten(0, 1)[rows],

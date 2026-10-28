@@ -6,8 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mjlab==1.6.0",
-    # Listed directly so [tool.uv.sources] below can route it per platform.
-    "torch>=2.7.0",
+    # torch and torchvision are pinned to exactly what the Docker base image ships
+    # (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404: torch 2.8.0 + torchvision 0.23.0 from the
+    # cu128 index), so the image reuses the base's copies instead of downloading them again.
+    # mjlab 1.6.0 needs torch>=2.7.0; rsl-rl-lib 5.4.2 needs torch>=2.6.0, torchvision>=0.5.0.
+    # Listed directly (torchvision too) so [tool.uv.sources] below can route them per platform.
+    "torch==2.8.0",
+    "torchvision==0.23.0",
     "huggingface_hub",
     "httpx",
     # Hugging Face's HTTP client; mprl.hub catches its connection errors (httpx2.TransportError).
@@ -42,17 +47,16 @@ build-backend = "hatchling.build"
 packages = ["src/mprl"]
 
 # --- torch wheels --------------------------------------------------------
-# Linux (the A100 pod) takes the CUDA 12.6 build; macOS keeps the default PyPI
-# (CPU/MPS) wheel. cu126 is chosen over cu130 because it needs the oldest NVIDIA
-# driver (12.x minor-version compatibility) and still ships torch 2.14.1, the same
-# version macOS resolves. cu128 stops at torch 2.11, so it is not used. The Linux
-# CUDA wheel also runs on CPU-only machines, which is how the Docker CPU matrix works.
+# Linux (the A100 pod and CI) takes the CUDA 12.8 build from the same index the
+# Docker base image installed it from; macOS keeps the default PyPI (CPU/MPS)
+# wheel. The Linux CUDA wheel also runs on CPU-only machines (GitHub runners).
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
