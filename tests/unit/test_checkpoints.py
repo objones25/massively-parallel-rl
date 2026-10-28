@@ -47,6 +47,20 @@ def test_list_sorted_by_iteration(tmp_path: Path):
     assert latest.iteration == 9
 
 
+def test_list_breaks_iteration_ties_by_train_seconds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store = CheckpointStore(tmp_path)
+    store.save_atomic(_write_ok, 5, 10.0)
+    store.save_atomic(_write_ok, 5, 20.0)
+    real_iterdir = Path.iterdir
+    # Directory order is not guaranteed; present the newer file first so only the sort key decides.
+    monkeypatch.setattr(Path, "iterdir", lambda self: iter(sorted(real_iterdir(self), reverse=True)))
+
+    assert [(r.iteration, r.train_seconds) for r in store.list()] == [(5, 10.0), (5, 20.0)]
+    latest = store.latest()
+    assert latest is not None
+    assert latest.train_seconds == pytest.approx(20.0)
+
+
 def test_empty_store(tmp_path: Path):
     store = CheckpointStore(tmp_path / "missing")
     assert store.list() == []

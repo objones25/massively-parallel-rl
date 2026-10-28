@@ -21,10 +21,12 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from rsl_rl.utils.log_writer import LogWriter
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import TASK_ID
+from mprl.negative_space import expect
 from mprl.timed_runner import TimedOnPolicyRunner
 
 pytestmark = pytest.mark.smoke
@@ -41,7 +43,9 @@ def build(tmp_path: Path) -> Iterator[Build]:
     """Factory: (env, runner) for the shipped G1 config, seeded with its own seed; closes envs."""
     envs: list[ManagerBasedRlEnv] = []
 
-    def _factory(runner_cls: type = TimedOnPolicyRunner, name: str = "logs") -> tuple[ManagerBasedRlEnv, Any]:
+    def _factory(
+        runner_cls: type = TimedOnPolicyRunner, name: str = "logs", logger: object = "tensorboard"
+    ) -> tuple[ManagerBasedRlEnv, Any]:
         env_cfg = load_env_cfg(TASK_ID)
         env_cfg.scene.num_envs = NUM_ENVS
         rl_cfg = load_rl_cfg(TASK_ID)
@@ -49,7 +53,7 @@ def build(tmp_path: Path) -> Iterator[Build]:
         env = ManagerBasedRlEnv(cfg=env_cfg, device="cpu")
         envs.append(env)
         agent_cfg = asdict(rl_cfg)
-        agent_cfg["logger"] = "tensorboard"
+        agent_cfg["logger"] = logger
         wrapped = RslRlVecEnvWrapper(env, clip_actions=rl_cfg.clip_actions)
         return env, runner_cls(wrapped, agent_cfg, str(tmp_path / name), "cpu")
 
@@ -61,6 +65,20 @@ def build(tmp_path: Path) -> Iterator[Build]:
 @pytest.fixture
 def store(tmp_path: Path) -> CheckpointStore:
     return CheckpointStore(tmp_path / "checkpoints")
+
+
+class RecordingWriter(LogWriter):
+    """A real rsl_rl LogWriter that records every model upload request."""
+
+    def __init__(self, log_dir: str) -> None:
+        self.log_dir = log_dir
+        self.saved_models: list[tuple[str, int]] = []
+
+    def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
+        pass
+
+    def save_model(self, model_path: str, it: int) -> None:
+        self.saved_models.append((model_path, it))
 
 
 def _busy_wait(seconds: float) -> None:
@@ -205,3 +223,43 @@ def test_hooks_run_in_order_off_the_clock(build: Build, store: CheckpointStore) 
     assert all(b[2] > a[2] for a, b in itertools.pairwise(events))
     # On the clock it would hold the 4 x 0.3 s of hook time too.
     assert clock.elapsed_s <= wall_s - 4 * 0.3
+
+
+def test_store_holds_only_checkpoints_and_one_final_onnx(build: Build, store: CheckpointStore, tmp_path: Path) -> None:
+    _, runner = build(logger={"class_name": RecordingWriter})
+    runner.cfg["upload_model"] = True  # the shipped default; learn_for must still not upload
+
+    result = runner.learn_for(TrainingClock(), 3.0, 1.0, store, fresh_start=True)
+
+    store_dir = tmp_path / "checkpoints"
+    checkpoints = {ref.path.name for ref in store.list()}
+    assert len(checkpoints) >= 2
+    assert {p.name for p in store_dir.iterdir()} == checkpoints | {"checkpoints.onnx"}
+    assert result.final.path.parent / "checkpoints.onnx" == store_dir / "checkpoints.onnx"
+    writer = runner.logger.writer
+    assert isinstance(writer, RecordingWriter)
+    assert not any(path.endswith(".tmp") for path, _ in writer.saved_models), writer.saved_models
+
+
+def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, store: CheckpointStore) -> None:
+    _, first = build(name="first")
+    first.learn_for(TrainingClock(), 2.0, 1.0, store, fresh_start=True)
+    loaded = expect(store.latest(), "first run saved no checkpoint")
+    before = {ref.path.name for ref in store.list()}
+
+    _, resumed = build(name="resumed")
+    infos = resumed.load(str(loaded.path))
+    clock = TrainingClock.from_state_dict(infos["clock"])
+    restored_s = clock.elapsed_s
+    result = resumed.learn_for(clock, restored_s + 1.5, 1.0, store, fresh_start=False)
+
+    new_refs = [ref for ref in store.list() if ref.path.name not in before]
+    iterations = [ref.iteration for ref in store.list()]
+    assert restored_s >= 2.0
+    assert new_refs
+    assert min(ref.iteration for ref in new_refs) > loaded.iteration
+    assert len(iterations) == len(set(iterations))
+    assert resumed.current_learning_iteration == loaded.iteration + result.iterations_run
+    assert result.final.iteration == resumed.current_learning_iteration
+    assert clock.elapsed_s >= restored_s + 1.5
+    assert torch.load(result.final.path, weights_only=False)["infos"]["clock"] == {"elapsed_s": clock.elapsed_s}

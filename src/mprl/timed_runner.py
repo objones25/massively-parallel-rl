@@ -1,7 +1,7 @@
 """Time-budgeted PPO runner: the core of the equal-training-time comparison.
 
 ``TimedOnPolicyRunner.learn_for`` mirrors ``OnPolicyRunner.learn`` from **rsl-rl-lib 5.4.2**
-(``rsl_rl/runners/on_policy_runner.py``) call for call, with three changes:
+(``rsl_rl/runners/on_policy_runner.py``) call for call, with these deliberate changes:
 
 1. The rollout + ``compute_returns`` and the PPO ``update()`` run inside two separate
    ``TrainingClock.measure()`` blocks. Nothing else is on the clock.
@@ -10,6 +10,14 @@
 3. Checkpoints are saved when the *training clock* crosses a multiple of ``checkpoint_every_s``
    (not every ``save_interval`` iterations) through ``CheckpointStore.save_atomic``, and the
    final iteration is always saved.
+4. A checkpoint save writes only the payload (``MjlabOnPolicyRunner.save``: weights, optimizer,
+   ``iter``, ``env_state``, plus ``infos["clock"]``). ``cfg["upload_model"]`` is forced False, so
+   no logger upload ever sees the store's temp path (uploads belong to the Hub publisher), and
+   ``VelocityOnPolicyRunner``'s per-save ONNX export is skipped. ONNX is exported once, for the
+   final checkpoint, next to its final (post-``os.replace``) path.
+5. A resumed run (``fresh_start=False``) starts at ``current_learning_iteration + 1``. Upstream
+   restarts at the loaded index, which re-labels that iteration: a duplicate logger step and a
+   second checkpoint file with the same iteration.
 
 ``tests/smoke/test_timed_runner.py::test_rsl_rl_version_is_the_one_learn_for_mirrors`` fails on any
 other rsl-rl-lib version, so an upgrade forces a re-read of the upstream loop.
@@ -41,6 +49,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.velocity.rl.runner import VelocityOnPolicyRunner
 from rsl_rl.utils import check_nan
 
@@ -99,7 +108,8 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
         """Train until ``clock`` reaches ``budget_s`` (checked after each iteration) or ``max_iterations``.
 
         ``fresh_start`` randomizes initial episode lengths (upstream ``init_at_random_ep_len``); a
-        resumed run must pass False so it does not re-randomize mid-training.
+        resumed run must pass False so it does not re-randomize mid-training, and then continues at
+        the iteration after the loaded one.
         """
         check_finite(budget_s, "budget_s")
         check_finite(checkpoint_every_s, "checkpoint_every_s")
@@ -114,6 +124,7 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
             f"budget already spent: clock at {clock.elapsed_s:.3f} s, budget {budget_s:.3f} s",
         )
         self._clock = clock
+        self.cfg["upload_model"] = False  # never upload from inside the loop; see header item 4
 
         # --- upstream setup (off the clock) ---
         if fresh_start:
@@ -127,7 +138,8 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
             self.alg.broadcast_parameters()
         self.logger.init_logging_writer()
 
-        start_it = self.current_learning_iteration
+        # Upstream: start_it = current_learning_iteration. On resume that index was already trained.
+        start_it = self.current_learning_iteration + (0 if fresh_start else 1)
         total_it = start_it + max_iterations
         last_saved_s = clock.elapsed_s  # a resumed run starts right after its checkpoint
         final: CheckpointRef | None = None
@@ -202,6 +214,8 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
             self.logger.stop_logging_writer()
         final = expect(final, "learn_for ran no iteration, so it saved no final checkpoint")
         require(final.iteration == self.current_learning_iteration, "final checkpoint is not the last iteration")
+        export_dir, onnx_name, _ = self._get_export_paths(str(final.path))
+        self.export_policy_to_onnx(str(export_dir), onnx_name)
         return LearnResult(
             iterations_run=iterations_run,
             final=final,
@@ -210,6 +224,10 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
         )
 
     def save(self, path: str, infos: dict[str, Any] | None = None) -> None:
-        """Upstream save plus ``infos["clock"]``, the training-clock state resume reads back."""
+        """Payload-only save: ``MjlabOnPolicyRunner.save`` (adds ``env_state``) plus ``infos["clock"]``.
+
+        Skips ``VelocityOnPolicyRunner.save``'s ONNX export, which would write next to the store's
+        temp path on every checkpoint; ``learn_for`` exports ONNX once for the final checkpoint.
+        """
         clock = expect(self._clock, "save() outside learn_for: no training clock to record")
-        super().save(path, {**(infos or {}), "clock": clock.state_dict()})
+        MjlabOnPolicyRunner.save(self, path, {**(infos or {}), "clock": clock.state_dict()})

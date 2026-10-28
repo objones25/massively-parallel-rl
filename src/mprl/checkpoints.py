@@ -60,7 +60,8 @@ class CheckpointStore:
             match = _NAME.match(entry.name)
             if match is not None and entry.is_file():
                 refs.append(CheckpointRef(int(match[1]), float(int(match[2])), entry))
-        return sorted(refs, key=lambda r: r.iteration)
+        # Ties on iteration (a resume that re-labelled an index) resolve to the later training time.
+        return sorted(refs, key=lambda r: (r.iteration, r.train_seconds))
 
     def latest(self) -> CheckpointRef | None:
         refs = self.list()
