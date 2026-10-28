@@ -26,6 +26,7 @@ from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import hf_raise_for_status
 
+import mprl.publish as publish_mod
 import mprl.train as train_mod
 from mprl.checkpoints import CheckpointStore
 from mprl.config import RunSpec
@@ -33,10 +34,12 @@ from mprl.errors import ConfigMismatch
 from mprl.hub import HubPublisher
 from mprl.negative_space import expect
 from mprl.paths import RunPaths
+from mprl.publish import finish_and_terminate
 from mprl.run_state import RunState, load_state, save_state
 from mprl.runpod import PodTerminator
 from mprl.timed_runner import TimedOnPolicyRunner
-from mprl.train import TrainDeps, finish_and_terminate, resolve_cfgs, train_run, wandb_logger_cfg
+from mprl.train import TrainDeps, resolve_cfgs, train_run, wandb_logger_cfg
+from mprl.wandb_writer import ResumableWandbWriter
 
 pytestmark = pytest.mark.smoke
 
@@ -271,6 +274,7 @@ def test_onnx_export_failure_is_recorded_not_raised(tmp_path: Path, monkeypatch:
 
     assert state.status == "complete"
     assert state.uploads["onnx"] == "RuntimeError: onnx exporter exploded"
+    assert state.uploads["post_training"] == "RuntimeError: onnx exporter exploded"
     assert CheckpointStore(RunPaths(tmp_path, spec).checkpoints_dir).latest() is not None
     assert load_state(RunPaths(tmp_path, spec).state_file) == state
 
@@ -310,6 +314,84 @@ def test_terminate_runs_after_failed_upload(tmp_path: Path, status: int, recorde
     assert events[-1][1] == state.uploads  # the failure was durable on disk before the DELETE
     assert final.path.is_file()
     assert api.upload_folder.call_args.kwargs["path_in_repo"] == path_in_repo
+    assert not (paths.run_dir / "upload").exists()  # staging removed after the failed attempt
+
+
+def _working_publisher() -> tuple[HubPublisher, Any]:
+    api = create_autospec(HfApi, instance=True)
+    api.upload_folder.return_value.commit_url = f"https://huggingface.co/{REPO}/commit/abc"
+    return HubPublisher(api, REPO, max_attempts=1, sleep=lambda _s: None), api
+
+
+def test_terminate_runs_after_staging_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full volume while staging the upload is recorded in state.json, and the DELETE still follows."""
+    spec = _spec(2.0)
+    paths = RunPaths(tmp_path, spec)
+    events: list[tuple[str, object]] = []
+    publisher, api = _working_publisher()
+
+    def no_space(*args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(publish_mod.shutil, "copy2", no_space)
+    state = train_run(spec, tmp_path, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
+    finish_and_terminate([state], _terminator(paths, events))
+
+    recorded = state.uploads[f"runs/main/{spec.run_id}"]
+    assert recorded.startswith("OSError:")
+    assert "No space left on device" in recorded
+    assert [name for name, _ in events] == ["DELETE"]
+    assert events[0][1] == state.uploads  # durable on disk before the DELETE
+    assert api.upload_folder.call_count == 0
+    assert not (paths.run_dir / "upload").exists()
+
+
+def test_failed_upload_is_retried_without_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = _spec(2.0)
+    paths = RunPaths(tmp_path, spec)
+    failing_api = create_autospec(HfApi, instance=True)
+    failing_api.upload_folder.side_effect = _http_error(503)
+    failing = HubPublisher(failing_api, REPO, max_attempts=1, sleep=lambda _s: None)
+    first = train_run(spec, tmp_path, TrainDeps(publisher=failing, wandb_mode="offline", device="cpu"))
+    path_in_repo = f"runs/main/{spec.run_id}"
+    assert first.uploads[path_in_repo].startswith("UploadFailed:")
+    before = CheckpointStore(paths.checkpoints_dir).list()
+
+    def no_env(*args: object, **kwargs: object) -> None:
+        raise AssertionError("an upload retry built an environment")
+
+    monkeypatch.setattr(train_mod, "ManagerBasedRlEnv", no_env)
+    publisher, api = _working_publisher()
+    second = train_run(spec, tmp_path, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
+
+    assert api.upload_folder.call_count == 1
+    assert api.upload_folder.call_args.kwargs["path_in_repo"] == path_in_repo
+    assert second.uploads[path_in_repo] == "ok"
+    assert load_state(paths.state_file) == second
+    assert second.train_seconds == first.train_seconds
+    assert CheckpointStore(paths.checkpoints_dir).list() == before
+    assert not (paths.run_dir / "upload").exists()
+
+
+def test_writer_stop_failure_still_exports_onnx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def stop_then_fail(self: ResumableWandbWriter) -> None:
+        wandb.finish()
+        raise RuntimeError("wandb down")
+
+    monkeypatch.setattr(ResumableWandbWriter, "stop", stop_then_fail)
+    spec = _spec(2.0)
+    paths = RunPaths(tmp_path, spec)
+
+    state = train_run(spec, tmp_path, DEPS)
+
+    final = expect(CheckpointStore(paths.checkpoints_dir).latest(), "no checkpoint")
+    onnx = paths.checkpoints_dir / "checkpoints.onnx"
+    assert state.status == "complete"
+    assert state.uploads["post_training"] == "RuntimeError: wandb down"
+    assert "onnx" not in state.uploads
+    assert onnx.is_file()
+    assert onnx.stat().st_mtime >= final.path.stat().st_mtime
+    assert load_state(paths.state_file) == state
 
 
 def test_only_num_envs_and_seed_differ_between_sweep_runs() -> None:

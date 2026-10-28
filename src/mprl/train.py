@@ -3,7 +3,8 @@
 Control flow of ``train_run`` (all paths under ``RunPaths(root, spec)``):
 
 1. A stored ``state.json`` whose ``config_hash`` differs from the spec's raises ``ConfigMismatch``.
-2. A ``complete`` state whose stored budget covers ``spec.budget_minutes`` is returned at once.
+2. A ``complete`` state whose stored budget covers ``spec.budget_minutes`` is returned without building an
+   env; if a publisher is given and the run's Hub upload is not "ok", only the upload is retried.
 3. With a checkpoint on disk the run resumes: the stored W&B id is reused with
    ``resume_from_iteration = checkpoint iteration``, the latest checkpoint is loaded into a fresh runner
    and the clock restored from it. With no checkpoint (fresh, or crashed before the first one) a new W&B
@@ -11,8 +12,9 @@ Control flow of ``train_run`` (all paths under ``RunPaths(root, spec)``):
 4. ``state.json`` is written ``running``, then ``learn_for`` runs to ``spec.budget_minutes * 60`` s of
    *total* training clock (cumulative across resumes). An error during training writes ``failed`` and
    re-raises. A checkpoint already at or past the budget (killed after the final save) trains nothing.
-5. ``state.json`` is written ``complete``, then the final checkpoint, its ONNX, the params and
-   ``state.json`` are uploaded; the outcome (or the ONNX export error) lands in ``state.uploads``.
+5. ``state.json`` is written ``complete``, then ``mprl.publish.upload_run`` uploads the final checkpoint, its
+   ONNX, the params and ``state.json``. Its outcome, and any error after the final checkpoint (writer stop,
+   ONNX export: ``post_training`` / ``onnx``), land in ``state.uploads``; none of them raises.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import mjlab.tasks  # noqa: F401  # pyright: ignore[reportUnusedImport]  (registers the tasks)
-from huggingface_hub.errors import HfHubHTTPError
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
@@ -39,22 +40,23 @@ from mprl import diagnostics
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import RunSpec, batch_arithmetic
-from mprl.errors import ConfigMismatch, UploadFailed
+from mprl.errors import ConfigMismatch
 from mprl.negative_space import expect, require
 from mprl.paths import RunPaths
+from mprl.publish import export_onnx, hub_path, upload_run
 from mprl.run_state import RunState, load_state, save_state
 from mprl.timed_runner import TimedOnPolicyRunner
 from mprl.wandb_writer import logger_cfg
 
 if TYPE_CHECKING:
     from mprl.hub import HubPublisher
-    from mprl.runpod import PodTerminator
 
 log = logging.getLogger(__name__)
 
 _REPO_DIR = Path(__file__).resolve().parents[2]
 _DEFAULT_WANDB_PROJECT = "mprl-humanoid-walk"  # .env.example default (plan, Task 14)
-_ONNX_KEY = "onnx"
+_ONNX_KEY = "onnx"  # state.uploads keys for errors that are not uploads
+_POST_TRAINING_KEY = "post_training"
 
 
 @dataclass(frozen=True)
@@ -94,9 +96,7 @@ def wandb_logger_cfg(
 ) -> dict[str, Any]:
     """``agent_cfg["logger"]``: the resumable writer plus run config (spec, batch arithmetic, SHA, digest)."""
     loaded = load_rl_cfg(spec.task_id)
-    rl_cfg = expect(
-        loaded if isinstance(loaded, RslRlOnPolicyRunnerCfg) else None, f"{spec.task_id} is not a PPO task"
-    )
+    rl_cfg = expect(loaded if isinstance(loaded, RslRlOnPolicyRunnerCfg) else None, f"{spec.task_id} is not a PPO task")
     batch = batch_arithmetic(spec.num_envs, rl_cfg.num_steps_per_env, rl_cfg.algorithm.num_mini_batches)
     extra: dict[str, Any] = {
         "run": asdict(spec),
@@ -141,7 +141,15 @@ def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:
             "Use a new sweep name or remove the run directory."
         )
     if state is not None and state.status == "complete" and state.budget_minutes >= spec.budget_minutes:
-        log.info("%s: complete at %.1f min budget; skipping", spec.run_id, state.budget_minutes)
+        if deps.publisher is not None and state.uploads.get(hub_path(spec)) != "ok":
+            log.info("%s: complete; retrying its upload only", spec.run_id)
+            final = expect(
+                CheckpointStore(paths.checkpoints_dir).latest(), f"{spec.run_id} is complete without a checkpoint"
+            )
+            state.uploads[hub_path(spec)] = upload_run(deps.publisher, paths, final)
+            save_state(paths.state_file, state)
+        else:
+            log.info("%s: complete at %.1f min budget; skipping", spec.run_id, state.budget_minutes)
         return state
 
     latest = CheckpointStore(paths.checkpoints_dir).latest()
@@ -168,27 +176,25 @@ def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:
         environ=os.environ,
     )
     try:
-        final, train_seconds, onnx_error = _train(spec, paths, deps, logger, latest)
+        final, train_seconds, errors = _train(spec, paths, deps, logger, latest)
     except BaseException:
         state.status = "failed"
         save_state(paths.state_file, state)
         raise
     state.status = "complete"
     state.train_seconds = train_seconds
-    if onnx_error is not None:
-        state.uploads[_ONNX_KEY] = onnx_error
+    state.uploads.update(errors)
     save_state(paths.state_file, state)
     if deps.publisher is not None:
-        path_in_repo = f"runs/{spec.sweep}/{spec.run_id}"
-        state.uploads[path_in_repo] = _upload(deps.publisher, paths, final, path_in_repo)
+        state.uploads[hub_path(spec)] = upload_run(deps.publisher, paths, final)
         save_state(paths.state_file, state)
     return state
 
 
 def _train(
     spec: RunSpec, paths: RunPaths, deps: TrainDeps, logger: dict[str, Any], latest: CheckpointRef | None
-) -> tuple[CheckpointRef, float, str | None]:
-    """Build env + fresh runner, resume from ``latest``, train to the budget: (final ref, clock s, ONNX error)."""
+) -> tuple[CheckpointRef, float, dict[str, str]]:
+    """Build env + fresh runner, resume from ``latest``, train to the budget: (final ref, clock s, errors)."""
     budget_s = spec.budget_minutes * 60.0
     env_cfg, agent_cfg = resolve_cfgs(spec, logger)
     configure_torch_backends()  # as mjlab's train script
@@ -207,7 +213,8 @@ def _train(
             clock = TrainingClock.from_state_dict(infos["clock"], sync=sync)
         if latest is not None and clock.elapsed_s >= budget_s:
             log.info("%s: checkpoint %s already covers the budget", spec.run_id, latest.path.name)
-            return latest, clock.elapsed_s, _export_onnx(runner, latest)
+            onnx_error = export_onnx(runner, latest)
+            return latest, clock.elapsed_s, {} if onnx_error is None else {_ONNX_KEY: onnx_error}
         return _learn(spec, paths, deps, runner, clock, budget_s, fresh_start=latest is None)
     finally:
         env.close()
@@ -222,7 +229,7 @@ def _learn(
     budget_s: float,
     *,
     fresh_start: bool,
-) -> tuple[CheckpointRef, float, str | None]:
+) -> tuple[CheckpointRef, float, dict[str, str]]:
     saved: list[CheckpointRef] = []
     diag, on_before_update, on_iteration = diagnostics.for_runner(runner, deps.diagnostics_every_k)
     diag.attach()
@@ -244,62 +251,13 @@ def _learn(
         if not final_saved or saved[-1].iteration != runner.current_learning_iteration:
             raise
         log.warning("%s: post-training step failed after the final checkpoint: %s", spec.run_id, error)
-        return saved[-1], clock.elapsed_s, f"{type(error).__name__}: {error}"
+        # The writer stop runs before the export, so its failure skipped the ONNX: export it here.
+        errors = {_POST_TRAINING_KEY: f"{type(error).__name__}: {error}"}
+        onnx_error = export_onnx(runner, saved[-1])
+        if onnx_error is not None:
+            errors[_ONNX_KEY] = onnx_error
+        return saved[-1], clock.elapsed_s, errors
     finally:
         diag.detach()
     require(result.final == saved[-1], "learn_for's final checkpoint was not reported to on_checkpoint")
-    return result.final, clock.elapsed_s, None
-
-
-def _onnx_path(checkpoint: CheckpointRef) -> Path:
-    # MjlabOnPolicyRunner._get_export_paths: "<checkpoint dir>/<checkpoint dir name>.onnx"
-    return checkpoint.path.parent / f"{checkpoint.path.parent.name}.onnx"
-
-
-def _export_onnx(runner: TimedOnPolicyRunner, final: CheckpointRef) -> str | None:
-    if _onnx_path(final).is_file():
-        return None
-    try:
-        runner.export_policy_to_onnx(str(final.path.parent), _onnx_path(final).name)
-    except Exception as error:
-        log.warning("ONNX export for %s failed: %s", final.path.name, error)
-        return f"{type(error).__name__}: {error}"
-    return None
-
-
-def _upload(publisher: HubPublisher, paths: RunPaths, final: CheckpointRef, path_in_repo: str) -> str:
-    """Stage final checkpoint, ONNX, params and state.json; upload; return "ok" or the error text."""
-    staging = paths.run_dir / "upload"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
-    shutil.copy2(final.path, staging / final.path.name)
-    if _onnx_path(final).is_file():
-        shutil.copy2(_onnx_path(final), staging / _onnx_path(final).name)
-    if (paths.run_dir / "params").is_dir():
-        shutil.copytree(paths.run_dir / "params", staging / "params")
-    shutil.copy2(paths.state_file, staging / paths.state_file.name)
-    try:
-        publisher.ensure_repo()
-        publisher.upload_folder(staging, path_in_repo, f"{paths.spec.run_id}: {final.path.name}")
-    except (UploadFailed, HfHubHTTPError) as error:
-        log.error("upload of %s to %s failed: %s", paths.spec.run_id, path_in_repo, error)
-        return f"{type(error).__name__}: {error}"
-    return "ok"
-
-
-def finish_and_terminate(states: list[RunState], terminator: PodTerminator | None) -> None:
-    """Log the outcome of every run, flush everything to disk, then terminate the pod as the very last action.
-
-    Every ``state.json`` and upload outcome was saved by ``train_run``; ``os.sync`` makes them durable on the
-    volume before the DELETE, which may kill this process before the confirming read returns.
-    """
-    for state in states:
-        log.info(
-            "%s: %s at %.1f s, uploads %s", state.run_id, state.status, state.train_seconds, state.uploads or "none"
-        )
-    os.sync()
-    if terminator is None:
-        log.info("no pod terminator; leaving the pod running")
-        return
-    terminator.terminate()
+    return result.final, clock.elapsed_s, {}
