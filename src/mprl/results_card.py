@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from mprl.config import TASK_ID, batch_arithmetic
+from mprl.curves import iqm_note
 
 if TYPE_CHECKING:
     from mprl.config import SweepSpec
@@ -23,6 +24,9 @@ _METRIC_DEFINITIONS = """\
 | `mean_tracking_reward` | the task's `track_linear_velocity` reward term only, `exp(-err^2 / std^2)` in (0, 1], \
 unweighted, mean over standing env-steps. Yaw tracking is not in it; it is `vel_error_yaw`. |"""
 
+# "Every evaluation command lies inside stage 0": EVAL_COMMANDS keep |lin_x| <= 1.0 and |ang_z| <= 0.5, and
+# the training lin_vel_y range is (-1.0, 1.0) at every curriculum stage (mjlab 1.6.0
+# tasks/velocity/velocity_env_cfg.py:192), so (0.0, 0.5, 0.0) is inside it too.
 _CURRICULUM = """\
 The shipped G1 flat task keeps its `command_vel` curriculum (the config is used unchanged). It advances
 on `env.common_step_counter`, which increments once per `env.step` regardless of `num_envs`, with stages
@@ -53,9 +57,9 @@ def model_card(
     eval_cfg: EvalConfig,
     primary_metric: str,
     final_points: Sequence[CurvePoint],
-    race: tuple[tuple[float, float, float], float, Mapping[int, str]],
+    race: tuple[tuple[float, float, float], float, float, Mapping[int, str]],
 ) -> str:
-    command, race_seconds, median = race
+    command, race_seconds, median_at, median = race
     batch_rows = []
     for n in sweep.env_counts:
         b = batch_arithmetic(n)
@@ -97,7 +101,8 @@ def model_card(
         "",
         "## Evaluation",
         "",
-        f"Every checkpoint at a mark is scored identically, whatever `num_envs` it trained at: the play env "
+        f"Every evaluated checkpoint is scored identically (cached rows are reused only under the same "
+        f"evaluation-config hash), whatever `num_envs` it trained at: the play env "
         f"(no observation noise, no pushes, no curriculum) with {eval_cfg.envs_per_command} env(s) per command, "
         f"seeds {', '.join(str(s) for s in eval_cfg.seeds)}, a {eval_cfg.horizon_s:g} s horizon, commands pinned.",
         "",
@@ -109,8 +114,10 @@ def model_card(
         "",
         f"## Results (primary metric: `{primary_metric}`)",
         "",
-        "`learning_curves.png` / `.svg`: mean across seeds, band min-max (with 3 seeds an IQM is just the "
-        "median, so mean + range is shown). A mark at which a run had no checkpoint yet has no point.",
+        f"`learning_curves.png` / `.svg`: mean across seeds, band min-max ({iqm_note(len(sweep.seeds))}). "
+        f"Each mark (every {sweep.eval_every_minutes:g} min, plus the {sweep.budget_minutes:g}-min budget) "
+        "shows the checkpoint that crossed it: the first saved at or after the mark and before the next "
+        f"{sweep.checkpoint_every_minutes:g}-min checkpoint mark. A mark no checkpoint crossed has no point.",
         "",
         f"Final mark{at}:",
         "",
@@ -118,9 +125,11 @@ def model_card(
         "| --- | --- | --- | --- |",
         *summary,
         "",
-        f"`race.mp4`: per env count, the median seed by `{primary_metric}` at the budget "
-        f"({', '.join(f'{n}: `{r}`' for n, r in sorted(median.items()))}), each checkpoint every "
-        f"{sweep.checkpoint_every_minutes:g} min rendered for {race_seconds:g} s in real time on command "
+        f"`race.mp4`: per env count, the median seed by `{primary_metric}` at {median_at:g} training minutes "
+        f"({', '.join(f'{n}: `{r}`' for n, r in sorted(median.items()))}; seeds ranked by ascending value, "
+        "and with an even seed count the lower-middle one), its checkpoint crossing every "
+        f"{sweep.checkpoint_every_minutes:g}-min mark and the budget, rendered for {race_seconds:g} s in real "
+        "time on command "
         f"{command} (1.0 m/s straight ahead, the most legible walking demo).",
         "",
         "`results.csv`: one row per run and evaluation mark (absent marks have no row).",

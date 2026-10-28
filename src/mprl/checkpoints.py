@@ -18,6 +18,7 @@ from mprl.negative_space import require
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+_STAMP_TOLERANCE_S = 1e-6  # marks are float minutes (0.05 * 60 = 3.0000000000000004); stamps are whole seconds
 _NAME = re.compile(r"^model_it(\d{7})_s(\d{6})\.pt$")
 
 
@@ -71,3 +72,19 @@ class CheckpointStore:
         limit = train_minutes * 60.0
         eligible = [r for r in self.list() if r.train_seconds <= limit]
         return eligible[-1] if eligible else None
+
+    def crossed(self, mark_minutes: float, interval_minutes: float) -> CheckpointRef | None:
+        """The checkpoint that crossed ``mark_minutes``: the earliest with ``mark <= t < mark + interval``.
+
+        A checkpoint is saved at the end of the first iteration at or past its mark, and its stamp is
+        rounded to whole seconds, so the 3:00 checkpoint is typically stamped 180-183 s; the window runs up
+        to (not including) the next mark's. None when no checkpoint is in the window: the mark is absent.
+        This is the one rule by which an evaluation mark, a curve point and a race-video frame pick a
+        checkpoint.
+        """
+        require(interval_minutes > 0.0, f"interval_minutes must be positive, got {interval_minutes}")
+        require(mark_minutes >= 0.0, f"mark_minutes must be non-negative, got {mark_minutes}")
+        low = mark_minutes * 60.0 - _STAMP_TOLERANCE_S
+        high = (mark_minutes + interval_minutes) * 60.0 - _STAMP_TOLERANCE_S
+        in_window = [r for r in self.list() if low <= r.train_seconds < high]
+        return min(in_window, key=lambda r: (r.train_seconds, r.iteration)) if in_window else None

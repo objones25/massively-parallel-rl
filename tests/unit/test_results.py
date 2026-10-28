@@ -12,16 +12,20 @@ from unittest.mock import create_autospec
 
 import pytest
 
-from mprl.checkpoints import CheckpointStore
+import mprl.results as results_mod
+from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.config import SweepSpec
 from mprl.curves import CurvePoint
 from mprl.errors import UploadFailed
-from mprl.evaluator import EvalConfig
+from mprl.evaluator import EvalConfig, EvalResult, evaluate_checkpoint
 from mprl.hub import HubPublisher
+from mprl.negative_space import CheckFailed
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.results import (
+    RunSource,
     build_results,
     eval_marks,
+    evaluate_source,
     marked_checkpoints,
     planned_sweep,
     publish_hub,
@@ -33,14 +37,18 @@ from mprl.sweep import pilot_spec
 SWEEP = SweepSpec("main")
 
 
+OVERSHOOT_S = (1, 2, 3)  # real saves land after the iteration that crosses their mark
+
+
 def _fill(store: CheckpointStore, minutes: list[float]) -> None:
+    """A checkpoint per mark, each stamped 1-3 s past it (e.g. 181 s, 362 s, 543 s, ...)."""
     for i, m in enumerate(minutes, start=1):
-        store.save_atomic(lambda p: p.write_bytes(b"w"), i * 10, m * 60.0)
+        store.save_atomic(lambda p: p.write_bytes(b"w"), i * 10, m * 60.0 + OVERSHOOT_S[i % 3])
 
 
-def test_eval_marks_every_interval_up_to_budget_inclusive():
+def test_eval_marks_every_interval_and_always_the_budget():
     assert eval_marks(3.0, 45.0) == [3.0 * k for k in range(1, 16)]
-    assert eval_marks(6.0, 45.0) == [6.0 * k for k in range(1, 8)]  # 42 is the last mark within 45
+    assert eval_marks(6.0, 45.0) == [*(6.0 * k for k in range(1, 8)), 45.0]  # eval_every_6min: ..., 42, 45
     assert eval_marks(0.05, 0.1) == [0.05, 0.1]
 
 
@@ -73,31 +81,76 @@ def test_reused_pilot_run_reads_the_pilot_checkpoints_up_to_max_minutes(tmp_path
     assert reused.eval_csv == pilot.eval_dir / "eval.csv"
     assert reused.source_run_id == pilot.spec.run_id
     assert reused.max_minutes == pytest.approx(45.0)
+    assert reused.interval_minutes == pytest.approx(3.0)
     own = sources["main-n00064-s0"]
     assert own.checkpoints_dir == RunPaths(tmp_path, small.runs()[0]).checkpoints_dir
     assert own.source_run_id == "main-n00064-s0"
     assert own.max_minutes == small.budget_minutes
 
 
-def test_marked_checkpoints_never_past_max_minutes(tmp_path: Path):
+def test_marked_checkpoints_pick_the_checkpoint_that_crossed_each_mark(tmp_path: Path):
     store = CheckpointStore(tmp_path / "ck")
-    _fill(store, [3.0 * k for k in range(1, 21)])  # a pilot that went on to 60 minutes
+    _fill(store, [3.0 * k for k in range(1, 16)])  # 3:00 .. 45:00, every stamp a little late
 
-    marked = marked_checkpoints(store, [3.0 * k for k in range(1, 21)], max_minutes=45.0)
+    marked = marked_checkpoints(store, [3.0 * k for k in range(1, 16)], interval_minutes=3.0, max_minutes=45.0)
 
-    assert max(ref.train_seconds for ref in marked.values() if ref is not None) == 45.0 * 60.0
-    assert marked[60.0] is not None
-    assert marked[60.0].train_seconds == 45.0 * 60.0
+    assert all(ref is not None for ref in marked.values())  # every mark has its checkpoint, the budget too
+    assert [round(ref.train_seconds // 60) for ref in marked.values() if ref is not None] == list(range(3, 46, 3))
 
 
-def test_mark_before_the_first_checkpoint_is_absent(tmp_path: Path):
+def test_reused_pilot_cap_is_the_checkpoint_that_crossed_max_minutes(tmp_path: Path):
     store = CheckpointStore(tmp_path / "ck")
-    _fill(store, [3.1, 6.0])
+    _fill(store, [3.0 * k for k in range(1, 21)])  # a pilot that went on to 60 minutes as the long run
 
-    marked = marked_checkpoints(store, [3.0, 6.0], max_minutes=45.0)
+    marked = marked_checkpoints(store, [42.0, 45.0], interval_minutes=3.0, max_minutes=45.0)
+
+    final = marked[45.0]
+    assert final is not None
+    assert 45.0 * 60.0 <= final.train_seconds < 48.0 * 60.0
+
+
+def test_marks_beyond_max_minutes_are_never_selected(tmp_path: Path):
+    store = CheckpointStore(tmp_path / "ck")
+    _fill(store, [3.0 * k for k in range(1, 21)])
+
+    with pytest.raises(CheckFailed, match="past"):
+        marked_checkpoints(store, [45.0, 48.0], interval_minutes=3.0, max_minutes=45.0)
+
+
+def test_mark_without_a_crossing_checkpoint_is_absent(tmp_path: Path):
+    store = CheckpointStore(tmp_path / "ck")
+    _fill(store, [6.0])  # the run's first save came after 6:00
+
+    marked = marked_checkpoints(store, [3.0, 6.0], interval_minutes=3.0, max_minutes=45.0)
 
     assert marked[3.0] is None
     assert marked[6.0] is not None
+
+
+def _fake_eval(run_id: str, ref: CheckpointRef, cfg: EvalConfig, device: str) -> EvalResult:
+    return EvalResult(run_id, ref.iteration, ref.train_seconds / 60.0, 0.5, 0.1, 1.0, cfg.horizon_s, 0.3)
+
+
+def test_eval_cache_is_reused_only_for_the_same_eval_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    run = tmp_path / "run"
+    _fill(CheckpointStore(run / "checkpoints"), [3.0, 6.0])
+    source = RunSource(
+        "main-n00064-s0", 64, 0, run / "checkpoints", run / "eval" / "eval.csv", "main-n00064-s0", 6.0, 3.0
+    )
+    fake = create_autospec(evaluate_checkpoint, side_effect=_fake_eval)
+    monkeypatch.setattr(results_mod, "evaluate_checkpoint", fake)
+    short, longer = EvalConfig(horizon_s=1.0), EvalConfig(horizon_s=2.0)
+
+    first = evaluate_source(source, [3.0, 6.0], short, "cpu")
+    again = evaluate_source(source, [3.0, 6.0], short, "cpu")
+    assert fake.call_count == 2  # the second pass was served from the cache
+    assert again == first
+
+    changed = evaluate_source(source, [3.0, 6.0], longer, "cpu")
+
+    assert fake.call_count == 4  # a different EvalConfig re-evaluates every row
+    assert {r.mean_time_to_fall_s for r in changed.values() if r is not None} == {2.0}
+    assert {r.run_id for r in changed.values() if r is not None} == {"main-n00064-s0"}
 
 
 def test_model_card_lists_cuts_exclusions_and_curriculum():
@@ -112,7 +165,7 @@ def test_model_card_lists_cuts_exclusions_and_curriculum():
         eval_cfg=EvalConfig(),
         primary_metric="vel_error_xy",
         final_points=[CurvePoint(64, 42.0, 0.5, 0.4, 0.6, 2), CurvePoint(4096, 42.0, 0.2, 0.1, 0.3, 2)],
-        race=((1.0, 0.0, 0.0), 4.0, {64: "main-n00064-s1", 4096: "main-n04096-s0"}),
+        race=((1.0, 0.0, 0.0), 4.0, 45.0, {64: "main-n00064-s1", 4096: "main-n04096-s0"}),
     )
 
     assert "eval_every_6min" in card
@@ -124,6 +177,10 @@ def test_model_card_lists_cuts_exclusions_and_curriculum():
     assert "track_linear_velocity" in card
     assert "main-n04096-s0" in card  # the reused pilot is disclosed
     assert "| (1.0, 0.0, 0.0) |" in card
+    assert "median seed by `vel_error_xy` at 45 training minutes" in card
+    assert "with 2 seeds an IQM is just the mean" in card  # two_seeds cut: never "with 3 seeds"
+    assert "3 seeds" not in card
+    assert "lower-middle" in card
     assert "| 4096 | 0.2 | 0.1 to 0.3 | 2 |" in card  # the final-mark summary
 
 
@@ -135,7 +192,7 @@ def test_model_card_without_a_manifest_says_no_cuts_recorded():
         eval_cfg=EvalConfig(),
         primary_metric="no_fall_fraction",
         final_points=[],
-        race=((1.0, 0.0, 0.0), 4.0, {}),
+        race=((1.0, 0.0, 0.0), 4.0, 45.0, {}),
     )
 
     assert "No sweep manifest" in card

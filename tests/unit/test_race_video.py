@@ -6,7 +6,7 @@ import imageio.v2 as imageio
 import numpy as np
 import pytest
 
-from mprl.checkpoints import CheckpointStore
+from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.negative_space import CheckFailed
 from mprl.race_video import (
     BANNER_HEIGHT,
@@ -25,11 +25,19 @@ def _solid(color: int, frames: int = 2) -> np.ndarray:
     return np.full((frames, H, W, 3), color, dtype=np.uint8)
 
 
+OVERSHOOT_S = 2.0  # a save lands after the iteration that crosses its mark
+
+
 def _store(tmp_path: Path, name: str, minutes: list[float]) -> CheckpointStore:
+    """Checkpoints for the given marks, each stamped a realistic 2 s past its mark."""
     store = CheckpointStore(tmp_path / name)
     for i, m in enumerate(minutes, start=1):
-        store.save_atomic(lambda p: p.write_bytes(b"w"), i, m * 60.0)
+        store.save_atomic(lambda p: p.write_bytes(b"w"), i, m * 60.0 + OVERSHOOT_S)
     return store
+
+
+def _mark_of(ref: CheckpointRef | None) -> float | None:
+    return None if ref is None else (ref.train_seconds - OVERSHOOT_S) / 60.0
 
 
 def test_compose_frame_shape():
@@ -87,19 +95,18 @@ def test_compose_rejects_mismatched_panel_sizes():
         compose_frame([Panel("a", _solid(1)), Panel("b", np.zeros((1, H, W + 2, 3), np.uint8))], "", columns=2)
 
 
-def test_timeline_picks_checkpoint_at_or_before_mark(tmp_path: Path):
+def test_timeline_picks_the_checkpoint_that_crossed_each_mark(tmp_path: Path):
     stores = {64: _store(tmp_path, "a", [3, 6, 9]), 256: _store(tmp_path, "b", [3, 6, 9, 12])}
-    timeline = race_timeline(stores, [6.0, 10.0, 12.0])
-    assert [mark for mark, _ in timeline] == [6.0, 10.0, 12.0]
-    picked = {
-        mark: {n: ref.train_seconds / 60.0 if ref else None for n, ref in refs.items()} for mark, refs in timeline
-    }
-    assert picked == {6.0: {64: 6.0, 256: 6.0}, 10.0: {64: 9.0, 256: 9.0}, 12.0: {64: 9.0, 256: 12.0}}
+    timeline = race_timeline(stores, [6.0, 9.0, 12.0], 3.0)
+    assert [mark for mark, _ in timeline] == [6.0, 9.0, 12.0]
+    picked = {mark: {n: _mark_of(ref) for n, ref in refs.items()} for mark, refs in timeline}
+    # 64 stopped after 9:00, so 12:00 has nothing for it (absent, not its 9:00 policy again).
+    assert picked == {6.0: {64: 6.0, 256: 6.0}, 9.0: {64: 9.0, 256: 9.0}, 12.0: {64: None, 256: 12.0}}
 
 
 def test_timeline_none_before_first_checkpoint(tmp_path: Path):
     stores = {64: _store(tmp_path, "a", [6, 9]), 256: _store(tmp_path, "b", [])}
-    (_, first), (_, second) = race_timeline(stores, [3.0, 6.0])
+    (_, first), (_, second) = race_timeline(stores, [3.0, 6.0], 3.0)
     assert first == {64: None, 256: None}
     assert second[64] is not None
     assert second[256] is None
@@ -107,9 +114,8 @@ def test_timeline_none_before_first_checkpoint(tmp_path: Path):
 
 def test_timeline_never_picks_checkpoint_after_last_mark(tmp_path: Path):
     stores = {64: _store(tmp_path, "a", [3, 6, 45, 48, 90])}
-    timeline = race_timeline(stores, [3.0, 45.0])
-    chosen = [refs[64] for _, refs in timeline]
-    assert [c.train_seconds / 60.0 for c in chosen if c] == [3.0, 45.0]
+    timeline = race_timeline(stores, [3.0, 45.0], 3.0)
+    assert [_mark_of(refs[64]) for _, refs in timeline] == [3.0, 45.0]
 
 
 def test_write_video_round_trip(tmp_path: Path):
@@ -126,8 +132,9 @@ def test_write_video_rejects_empty(tmp_path: Path):
 
 
 def test_race_frames_render_each_checkpoint_once(tmp_path: Path):
-    store = _store(tmp_path, "n64", [3.0])  # one checkpoint, shown at both later marks
-    timeline = race_timeline({64: store, 256: _store(tmp_path, "n256", [])}, [0.0, 3.0, 6.0])
+    store = _store(tmp_path, "n64", [3.0])
+    ref = store.list()[0]
+    timeline = [(0.0, {64: None, 256: None}), (3.0, {64: ref, 256: None}), (6.0, {64: ref, 256: None})]
     rendered: list[Path] = []
 
     def render(ref):

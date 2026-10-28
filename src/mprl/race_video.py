@@ -81,15 +81,18 @@ def compose_frame(panels: Sequence[Panel], clock_label: str, *, columns: int, in
 
 
 def race_timeline(
-    checkpoints: Mapping[int, CheckpointStore], marks_minutes: Sequence[float]
+    checkpoints: Mapping[int, CheckpointStore], marks_minutes: Sequence[float], interval_minutes: float
 ) -> list[tuple[float, dict[int, CheckpointRef | None]]]:
-    """Per mark, each env count's latest checkpoint at or before it (``None`` before its first).
+    """Per mark, each env count's checkpoint that crossed it (``CheckpointStore.crossed``), else ``None``.
 
-    A checkpoint later than a mark is never chosen for it, so a store holding more training than the
-    last mark (a reused longer pilot) is capped by the marks.
+    The window ends before the next mark, so a checkpoint past the last mark (a reused longer pilot) is
+    never chosen.
     """
     require(len(checkpoints) > 0, "need at least one env count")
-    return [(float(mark), {n: store.at_or_before(mark) for n, store in checkpoints.items()}) for mark in marks_minutes]
+    return [
+        (float(mark), {n: store.crossed(mark, interval_minutes) for n, store in checkpoints.items()})
+        for mark in marks_minutes
+    ]
 
 
 def _clock(minutes: float) -> str:

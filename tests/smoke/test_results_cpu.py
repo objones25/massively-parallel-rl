@@ -62,7 +62,11 @@ def test_build_results_end_to_end_cpu(tmp_path: Path, monkeypatch: pytest.Monkey
         reader.close()
     csv_lines = (out / "results.csv").read_text().splitlines()
     assert csv_lines[0].startswith("mark_minutes,num_envs,seed,run_id,iteration,train_minutes,vel_error_xy")
-    assert len(csv_lines) > 1
+    rows = {tuple(line.split(",")[:4]) for line in csv_lines[1:]}
+    every_mark = {
+        (repr(mark), str(spec.num_envs), str(spec.seed), spec.run_id) for spec in SWEEP.runs() for mark in (0.05, 0.1)
+    }
+    assert rows == every_mark  # every run has its crossing checkpoint at every mark, the budget mark included
     assert "vel_error_xy" in (out / "README.md").read_text()
     status = json.loads((out.parent / "results_publish.json").read_text())
     assert status == {"wandb": "ok", "hub": "skipped: no publisher"}

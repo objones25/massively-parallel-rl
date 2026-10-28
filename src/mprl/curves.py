@@ -1,11 +1,13 @@
 """Seed aggregation and the learning-curve figure.
 
-A run's value at a mark is its latest evaluated checkpoint at or before that mark (the policy that
-existed by then on the training clock, as ``CheckpointStore.at_or_before`` picks it). A mark at which
-no run of a count has a checkpoint yet has no point: absent, never zero.
+Results arrive keyed by mark (``run id -> {mark: result or None}``), as evaluation produced them from
+the checkpoint that crossed each mark (``CheckpointStore.crossed``); nothing here re-selects by
+training time, and a point's x is its mark. A mark at which no run of a count has a result has no
+point: absent, never zero.
 
 The curve is the mean across seeds with the min-max range as the band. With 3 seeds an IQM is just
-the median, so mean plus range says more; the chart caption states this.
+the median (with 2, the mean), so mean plus range says more; the chart caption states this with the
+actual seed count.
 """
 
 from __future__ import annotations
@@ -30,7 +32,6 @@ METRICS: Final[tuple[str, ...]] = tuple(
 )
 """The metric names a curve can plot: ``EvalResult``'s float fields except the x-axis, ``train_minutes``."""
 
-_MARK_TOLERANCE_MIN: Final = 1e-9
 # Ordinal blue ramp (steps 250..650 of the dataviz reference palette), light to dark with num_envs;
 # the lightest step clears 2:1 against the light surface.
 _RAMP: Final = ("#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281")
@@ -56,37 +57,33 @@ def validate_metric(metric: str) -> None:
         raise ValueError(f"unknown metric {metric!r}; valid metrics: {', '.join(METRICS)}")
 
 
-def _value_at(results: Sequence[EvalResult], metric: str, mark: float) -> float | None:
-    """``metric`` of the latest result (by training time) at or before ``mark``; None if there is none."""
-    eligible = [r for r in results if r.train_minutes <= mark + _MARK_TOLERANCE_MIN]
-    if not eligible:
-        return None
-    latest = max(eligible, key=lambda r: (r.train_minutes, r.iteration))
-    return float(getattr(latest, metric))
+MarkedResults = Mapping[str, Mapping[float, EvalResult | None]]
+"""Run id -> {mark minutes: the evaluation of the checkpoint that crossed the mark, or None}."""
 
 
-def _by_run(results: Sequence[EvalResult], run_envs: Mapping[str, int]) -> dict[str, list[EvalResult]]:
-    grouped: dict[str, list[EvalResult]] = {run_id: [] for run_id in run_envs}
-    for result in results:
-        if result.run_id in grouped:
-            grouped[result.run_id].append(result)
-    return grouped
+def _values_at(marked: MarkedResults, runs: Sequence[str], metric: str, mark: float) -> list[tuple[float, str]]:
+    """``(metric value, run id)`` for each of ``runs`` that has a result at ``mark``."""
+    out: list[tuple[float, str]] = []
+    for run_id in runs:
+        result = marked.get(run_id, {}).get(mark)
+        if result is not None:
+            out.append((float(getattr(result, metric)), run_id))
+    return out
 
 
 def aggregate(
-    results: Sequence[EvalResult], metric: str, run_envs: Mapping[str, int], marks_minutes: Sequence[float]
+    marked: MarkedResults, metric: str, run_envs: Mapping[str, int], marks_minutes: Sequence[float]
 ) -> list[CurvePoint]:
     """One point per (count, mark) with at least one seed; count-major, then by mark.
 
     ``run_envs`` maps each run id of the sweep to its env count; results of other runs are ignored.
     """
     validate_metric(metric)
-    grouped = _by_run(results, run_envs)
     points: list[CurvePoint] = []
     for num_envs in sorted(set(run_envs.values())):
         runs = [run_id for run_id, n in run_envs.items() if n == num_envs]
         for mark in marks_minutes:
-            values = [v for run_id in runs if (v := _value_at(grouped[run_id], metric, mark)) is not None]
+            values = [v for v, _ in _values_at(marked, runs, metric, mark)]
             if values:
                 points.append(
                     CurvePoint(num_envs, float(mark), sum(values) / len(values), min(values), max(values), len(values))
@@ -95,39 +92,41 @@ def aggregate(
 
 
 def median_seed_run(
-    results: Sequence[EvalResult], metric: str, run_envs: Mapping[str, int], at_minutes: float
+    marked: MarkedResults, metric: str, run_envs: Mapping[str, int], at_minutes: float
 ) -> dict[int, str]:
-    """Per env count, the run whose ``metric`` at ``at_minutes`` is the median of its seeds.
+    """Per env count, the run whose ``metric`` at the mark ``at_minutes`` is the median of its seeds.
 
     Seeds are ranked ascending by (value, run id) with NaN last, and the median is the lower middle
-    for an even count. A count with no result by ``at_minutes`` is left out.
+    for an even count. A count with no result at that mark is left out.
     """
     validate_metric(metric)
-    grouped = _by_run(results, run_envs)
     chosen: dict[int, str] = {}
     for num_envs in sorted(set(run_envs.values())):
-        scored = [
-            (math.isnan(v), v, run_id)
-            for run_id, n in run_envs.items()
-            if n == num_envs and (v := _value_at(grouped[run_id], metric, at_minutes)) is not None
-        ]
+        runs = [run_id for run_id, n in run_envs.items() if n == num_envs]
+        scored = [(math.isnan(v), v, run_id) for v, run_id in _values_at(marked, runs, metric, at_minutes)]
         if scored:
             scored.sort()
             chosen[num_envs] = scored[(len(scored) - 1) // 2][2]
     return chosen
 
 
-def caption(counts: Sequence[int]) -> str:
-    """Chart caption: the band's meaning and the batch arithmetic per count."""
+def iqm_note(n_seeds: int) -> str:
+    """Why the band is mean + range, for the actual seed count."""
+    if n_seeds == 3:
+        return "with 3 seeds an IQM is just the median, so mean + range is shown"
+    if n_seeds == 2:
+        return "with 2 seeds an IQM is just the mean, so mean + range is shown"
+    return f"with {n_seeds} seed(s), mean + range is shown"
+
+
+def caption(counts: Sequence[int], n_seeds: int) -> str:
+    """Chart caption: the band's meaning (for ``n_seeds``) and the batch arithmetic per count."""
     batches = [batch_arithmetic(n) for n in counts]
     per_count = "; ".join(
         f"{b.num_envs:,} envs: {b.batch_size:,} samples/iter ({b.num_mini_batches} x {b.minibatch_size:,})"
         for b in batches
     )
-    return (
-        "Line: mean across seeds; band: min-max across seeds (with 3 seeds an IQM is just the median, "
-        f"so mean + range is shown). Batch = envs x {batches[0].steps_per_env} steps per iteration: {per_count}."
-    )
+    return f"Line: mean across seeds; band: min-max across seeds ({iqm_note(n_seeds)}). Batch = envs x {batches[0].steps_per_env} steps per iteration: {per_count}."
 
 
 def plot_learning_curves(points: Sequence[CurvePoint], metric_label: str, out: Path) -> None:
@@ -158,7 +157,9 @@ def plot_learning_curves(points: Sequence[CurvePoint], metric_label: str, out: P
     for side in ("left", "bottom"):
         ax.spines[side].set_color(_GRID)
     ax.legend(frameon=False, labelcolor=_TEXT)
-    fig.text(0.01, 0.01, caption(counts), wrap=True, fontsize=8, color=_MUTED, va="bottom")
+    fig.text(
+        0.01, 0.01, caption(counts, max(p.n_seeds for p in points)), wrap=True, fontsize=8, color=_MUTED, va="bottom"
+    )
     fig.subplots_adjust(left=0.09, right=0.88, top=0.95, bottom=0.2)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150, facecolor=_SURFACE)

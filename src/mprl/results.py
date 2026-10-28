@@ -3,13 +3,16 @@ then a W&B ``results`` run and the Hugging Face upload.
 
 The runs are those of the *planned* sweep in ``sweep_manifest.json`` (counts, seeds and eval cadence
 after any cut); without a manifest, the requested ``sweep``. A run the pilot stood in for
-(``pilot_reuse.json``) reads the pilot's checkpoints, never past ``max_minutes``, and its evaluations are
-cached in the pilot's own ``eval/eval.csv`` (they belong to its checkpoints).
+(``pilot_reuse.json``) reads the pilot's checkpoints, up to the one that crossed ``max_minutes``, and its
+evaluations are cached in the pilot's own ``eval/eval.csv`` (they belong to its checkpoints).
 
-Evaluation marks are every ``eval_every_minutes`` up to the budget; each mark takes the latest
-checkpoint at or before it (``CheckpointStore.at_or_before``); a mark with none is absent. An
-evaluation is cached per (run, checkpoint iteration) in the run's ``eval/eval.csv`` and reused while
-its training time still matches, so re-running evaluates only what is new. Everything is off the
+Evaluation marks are every ``eval_every_minutes`` plus always the budget; race-video marks every
+``checkpoint_every_minutes`` plus the budget. A mark takes the checkpoint that crossed it
+(``CheckpointStore.crossed`` with the checkpoint interval); a mark with none is absent. Results stay
+keyed by mark from here on (CSV, curves, median seed). An evaluation is cached per (run, checkpoint
+iteration) in the run's ``eval/eval.csv``, with the ``EvalConfig`` hash in ``eval/eval_config.json``;
+a row is reused only under the same config hash and while its training time still matches, so
+re-running evaluates only what is new. Everything is off the
 training clock. Publishing outcomes go to ``<sweep>/results_publish.json`` (next to the results dir, so
 it is not uploaded stale) and the log; a publish failure never touches the local results.
 """
@@ -17,12 +20,13 @@ it is not uploaded stale) and the log; a publish failure never touches the local
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import astuple, dataclass, fields
+from dataclasses import asdict, astuple, dataclass, fields
 from pathlib import Path
 from typing import Any, Final
 
@@ -67,14 +71,15 @@ class RunSource:
     eval_csv: Path
     source_run_id: str
     max_minutes: float
+    interval_minutes: float  # checkpoint interval: the width of a mark's crossing window
 
 
 def eval_marks(every_minutes: float, budget_minutes: float) -> list[float]:
-    """``every, 2 * every, ...`` up to ``budget`` inclusive."""
+    """``every, 2 * every, ...`` below ``budget``, then ``budget`` itself (always a mark)."""
     require(0 < every_minutes <= budget_minutes, f"bad cadence {every_minutes} for budget {budget_minutes}")
-    count = math.floor(budget_minutes / every_minutes + _MARK_TOLERANCE_MIN)
-    require(count <= _MAX_MARKS, f"{count} marks exceed {_MAX_MARKS}")
-    return [round(every_minutes * k, 9) for k in range(1, count + 1)]
+    count = math.ceil(budget_minutes / every_minutes - _MARK_TOLERANCE_MIN) - 1  # multiples strictly below
+    require(count < _MAX_MARKS, f"{count} marks exceed {_MAX_MARKS}")
+    return [*(round(every_minutes * k, 9) for k in range(1, count + 1)), budget_minutes]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -119,39 +124,68 @@ def run_sources(sweep: SweepSpec, root: Path) -> list[RunSource]:
                 paths.eval_dir / "eval.csv",
                 paths.spec.run_id,
                 max_minutes,
+                sweep.checkpoint_every_minutes,
             )
         )
     return sources
 
 
 def marked_checkpoints(
-    store: CheckpointStore, marks: Sequence[float], max_minutes: float
+    store: CheckpointStore, marks: Sequence[float], *, interval_minutes: float, max_minutes: float
 ) -> dict[float, CheckpointRef | None]:
-    """Per mark, the latest checkpoint at or before it and never past ``max_minutes``."""
-    marked = {mark: store.at_or_before(min(mark, max_minutes)) for mark in marks}
+    """Per mark, the checkpoint that crossed it. No mark may lie past ``max_minutes``, so nothing is taken
+    beyond the checkpoint that crossed ``max_minutes`` (a reused pilot's cap)."""
+    for mark in marks:
+        require(mark <= max_minutes + _MARK_TOLERANCE_MIN, f"mark {mark} is past {max_minutes} min")
+    marked = {mark: store.crossed(mark, interval_minutes) for mark in marks}
+    cap_s = (max_minutes + interval_minutes) * 60.0
     for ref in marked.values():
-        require(ref is None or ref.train_seconds <= max_minutes * 60.0, f"{ref} is past {max_minutes} min")
+        require(ref is None or ref.train_seconds < cap_s, f"{ref} is past the checkpoint crossing {max_minutes} min")
     return marked
 
 
-def _write_eval_cache(results: Sequence[EvalResult], path: Path) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
+def eval_config_hash(cfg: EvalConfig) -> str:
+    return hashlib.sha256(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()
+
+
+def _config_file(eval_csv: Path) -> Path:
+    return eval_csv.with_name("eval_config.json")
+
+
+def _read_eval_cache(eval_csv: Path, config_hash: str) -> dict[int, EvalResult]:
+    """Cached rows by iteration, or nothing when they were scored under another (or unknown) config."""
+    stored = _read_json(_config_file(eval_csv)).get("config_hash")
+    if not eval_csv.is_file() or stored != config_hash:
+        return {}
+    return {r.iteration: r for r in read_eval_csv(eval_csv)}
+
+
+def _write_eval_cache(results: Sequence[EvalResult], eval_csv: Path, cfg: EvalConfig) -> None:
+    """CSV first, then the config hash: a crash between the two leaves a mismatch, which re-evaluates."""
+    tmp = eval_csv.with_name(f".{eval_csv.name}.tmp")
     write_eval_csv(sorted(results, key=lambda r: r.iteration), tmp)
-    os.replace(tmp, path)
+    os.replace(tmp, eval_csv)
+    config = {"config_hash": eval_config_hash(cfg), "eval_config": asdict(cfg)}
+    _config_file(eval_csv).write_text(json.dumps(config, indent=2) + "\n")
 
 
 def evaluate_source(
     source: RunSource, marks: Sequence[float], cfg: EvalConfig, device: str
 ) -> dict[float, EvalResult | None]:
     """Per mark, the evaluation of its checkpoint (cached or new), labelled with the sweep run id."""
-    cache = {r.iteration: r for r in read_eval_csv(source.eval_csv)} if source.eval_csv.is_file() else {}
-    marked = marked_checkpoints(CheckpointStore(source.checkpoints_dir), marks, source.max_minutes)
+    cache = _read_eval_cache(source.eval_csv, eval_config_hash(cfg))
+    marked = marked_checkpoints(
+        CheckpointStore(source.checkpoints_dir),
+        marks,
+        interval_minutes=source.interval_minutes,
+        max_minutes=source.max_minutes,
+    )
     for ref in sorted({ref for ref in marked.values() if ref is not None}):
         hit = cache.get(ref.iteration)
         if hit is None or not math.isclose(hit.train_minutes, ref.train_seconds / 60.0):
             log.info("evaluating %s iteration %d", source.source_run_id, ref.iteration)
             cache[ref.iteration] = evaluate_checkpoint(source.source_run_id, ref, cfg, device)
-            _write_eval_cache(list(cache.values()), source.eval_csv)  # progress survives a crash
+            _write_eval_cache(list(cache.values()), source.eval_csv, cfg)  # progress survives a crash
     out: dict[float, EvalResult | None] = {}
     for mark, ref in marked.items():
         result = None if ref is None else cache[ref.iteration]
@@ -192,10 +226,8 @@ def _render_race(
     chosen = {n: by_id[run_id] for n, run_id in sorted(median.items())}
     stores = {n: CheckpointStore(s.checkpoints_dir) for n, s in chosen.items()}
     marks = eval_marks(sweep.checkpoint_every_minutes, sweep.budget_minutes)
-    timeline = race_timeline(stores, marks)
-    for _, refs in timeline:
-        for n, ref in refs.items():
-            require(ref is None or ref.train_seconds <= chosen[n].max_minutes * 60.0, f"{ref} past its cap")
+    require(all(marks[-1] <= s.max_minutes for s in chosen.values()), "a race mark is past a run's cap")
+    timeline = race_timeline(stores, marks, sweep.checkpoint_every_minutes)
 
     def render(ref: CheckpointRef) -> np.ndarray:
         return render_rollout(ref, RACE_COMMAND, seconds, height=size[0], width=size[1], device=device)
@@ -281,15 +313,14 @@ def build_results(
     evals = {s.run_id: evaluate_source(s, marks, cfg, device) for s in bounded(sources, len(sources), "runs")}
     write_results_csv(sources, evals, out / "results.csv")
 
-    results = [r for per_mark in evals.values() for r in per_mark.values() if r is not None]
     run_envs = {s.run_id: s.num_envs for s in sources}
-    points = aggregate(results, primary_metric, run_envs, marks)
+    points = aggregate(evals, primary_metric, run_envs, marks)
     require(len(points) > 0, f"sweep {planned.name}: no run has a checkpoint at any mark; nothing to show")
     plot_learning_curves(points, primary_metric, out / "learning_curves.png")
-    median = median_seed_run(results, primary_metric, run_envs, at_minutes=planned.budget_minutes)
+    last = max(p.minutes for p in points)  # the budget, unless every run stopped before it
+    median = median_seed_run(evals, primary_metric, run_envs, at_minutes=last)
     _render_race(sources, median, planned, out / "race.mp4", seconds=render_seconds, size=render_size, device=device)
 
-    last = max(p.minutes for p in points)
     reuse = _read_json(out / "pilot_reuse.json")
     card = model_card(
         planned,
@@ -298,11 +329,11 @@ def build_results(
         eval_cfg=cfg,
         primary_metric=primary_metric,
         final_points=[p for p in points if p.minutes == last],
-        race=(RACE_COMMAND, render_seconds, median),
+        race=(RACE_COMMAND, render_seconds, last, median),
     )
     (out / "README.md").write_text(card)
 
-    config = {"sweep": planned.name, "primary_metric": primary_metric, "median_runs": median}
+    config = {"sweep": planned.name, "primary_metric": primary_metric, "median_runs": median, "median_at": last}
     status = {"wandb": _publish_wandb(planned, out, wandb_mode, config), "hub": publish_hub(planned, out, publisher)}
     (out.parent / "results_publish.json").write_text(json.dumps(status, indent=2) + "\n")
     for target, outcome in status.items():
