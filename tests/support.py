@@ -28,6 +28,23 @@ NUM_ENVS = 4
 STEPS_PER_ITERATION = 24  # num_steps_per_env in the shipped G1 PPO config
 LONG_S = 3600.0  # a budget / checkpoint interval no smoke run reaches
 EVERY_MIN = 1.0 / 60.0  # train_run tests: a checkpoint every 1 s of training clock
+# Fake time for the cadence tests: each TrainingClock.measure() reads `now` exactly twice (start, end), so a
+# Ticker makes every measure last TICK_S whatever the machine; an iteration has two measures (rollout, update),
+# so one iteration is 0.5 s of training clock, about what a real G1 iteration at 4 envs takes on the Mac.
+TICK_S = 0.25
+ITERATION_S = 2 * TICK_S
+
+
+class Ticker:
+    """A deterministic time source: every call returns the previous value plus ``step`` (starting at ``step``)."""
+
+    def __init__(self, step: float) -> None:
+        self._step = step
+        self._t = 0.0
+
+    def __call__(self) -> float:
+        self._t += self._step
+        return self._t
 
 
 def run_spec(budget_s: float, *, every_minutes: float = EVERY_MIN, num_envs: int = NUM_ENVS, seed: int = 0) -> RunSpec:

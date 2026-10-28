@@ -1,7 +1,8 @@
 """Smoke tests for TimedOnPolicyRunner against real mjlab / rsl_rl on CPU with 4 envs.
 
-On this Mac one G1 flat iteration at 4 envs takes about 0.5 s of training clock, so the budgets
-below (2-4 s) run a handful of iterations each. The training loop is the behavior here, so every run is
+Tests that assert a cadence (how many iterations or checkpoints a budget yields) run the training clock on a
+fake time source (support.Ticker, or env.step / alg.update / checkpoint writes advancing a counter), so they
+hold on any machine; the training itself is always real. The training loop is the behavior here, so every run is
 real; tests that only read a run's outcome share one module-scoped run (``recorded_run``, ``hooked_run``).
 """
 
@@ -20,7 +21,7 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.registry import load_runner_cls
 from rsl_rl.utils.log_writer import LogWriter
-from support import LONG_S, STEPS_PER_ITERATION, make_env_runner
+from support import ITERATION_S, LONG_S, STEPS_PER_ITERATION, TICK_S, Ticker, make_env_runner
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
@@ -32,7 +33,6 @@ pytestmark = pytest.mark.smoke
 
 Build = Callable[..., tuple[ManagerBasedRlEnv, Any]]
 HOOK_BUSY_S = 0.1  # off-clock work per hook call
-SAVE_BUSY_S = 0.3  # off-clock work per checkpoint write
 
 
 class RecordingWriter(LogWriter):
@@ -62,7 +62,7 @@ def _actor_params(runner: Any) -> list[torch.Tensor]:
 
 @dataclass(frozen=True)
 class RecordedRun:
-    """One real ``learn_for(budget 4 s, checkpoint every 1 s)`` with ``upload_model`` on, as plain data."""
+    """One real ``learn_for(budget 4 s, checkpoint every 1 s)`` on a Ticker clock, ``upload_model`` on, as data."""
 
     result: LearnResult
     elapsed_s: float
@@ -97,7 +97,7 @@ def recorded_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RecordedR
     try:
         runner.cfg["upload_model"] = True  # the shipped default; learn_for must still not upload
         store = CheckpointStore(root / "checkpoints")
-        clock = TrainingClock(sync=cuda_sync_for("cpu"))
+        clock = TrainingClock(now=Ticker(TICK_S), sync=cuda_sync_for("cpu"))  # 8 iterations of ITERATION_S
         saved_at: list[tuple[CheckpointRef, float]] = []
         ends: list[float] = []
         result = runner.learn_for(
@@ -128,7 +128,7 @@ def test_learn_for_stops_when_budget_reached(recorded_run: RecordedRun) -> None:
     ends = recorded_run.iteration_ends
 
     assert result.budget_exhausted
-    assert result.iterations_run == len(ends)
+    assert result.iterations_run == len(ends) == round(BUDGET_S / ITERATION_S)
     assert ends[-1] == recorded_run.elapsed_s
     assert ends[-2] < BUDGET_S <= ends[-1]  # stops after exactly the iteration that crossed the budget
     assert result.overshoot_s == pytest.approx(recorded_run.elapsed_s - BUDGET_S)
@@ -139,7 +139,7 @@ def test_budget_stop_saves_the_final_checkpoint_off_cadence(build: Build, store:
     """With no checkpoint mark ever due, the iteration that crosses the budget still saves the one checkpoint."""
     _, runner = build()
 
-    result = runner.learn_for(TrainingClock(sync=cuda_sync_for("cpu")), 3.0, LONG_S, store, fresh_start=True)
+    result = runner.learn_for(TrainingClock(now=Ticker(TICK_S)), 3.0, LONG_S, store, fresh_start=True)
 
     assert result.budget_exhausted
     assert store.list() == [result.final]
@@ -161,34 +161,33 @@ def test_checkpoints_follow_training_clock(recorded_run: RecordedRun) -> None:
 def test_store_holds_only_checkpoints_and_one_final_onnx(recorded_run: RecordedRun) -> None:
     checkpoints = {ref.path.name for ref in recorded_run.stored}
 
-    assert len(checkpoints) >= 2
+    assert len(checkpoints) == 4  # the 1, 2 and 3 s marks, and the budget at 4 s
     assert recorded_run.store_files == checkpoints | {"checkpoints.onnx"}
     assert recorded_run.result.final.path.parent / "checkpoints.onnx" == recorded_run.store_dir / "checkpoints.onnx"
     assert not any(path.endswith(".tmp") for path, _ in recorded_run.uploads_requested), recorded_run.uploads_requested
 
 
 def test_io_is_off_the_clock(build: Build, store: CheckpointStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint writes advance the time source too, yet the clock holds only the rollouts and updates."""
     _, runner = build()
-    clock = TrainingClock(sync=cuda_sync_for("cpu"))
+    fake_now = _advance_on_step_and_update(runner)
     real_save_atomic = store.save_atomic
-    busy: list[float] = []
+    saves: list[int] = []
 
     def slow_save_atomic(write: Callable[[Path], None], iteration: int, train_seconds: float) -> CheckpointRef:
         def slow_write(path: Path) -> None:
-            _busy_wait(SAVE_BUSY_S)
-            busy.append(SAVE_BUSY_S)
+            fake_now[0] += SAVE_COST_S
+            saves.append(iteration)
             write(path)
 
         return real_save_atomic(slow_write, iteration, train_seconds)
 
     monkeypatch.setattr(store, "save_atomic", slow_save_atomic)
-    wall_start = time.perf_counter()
-    runner.learn_for(clock, 2.0, 1.0, store, fresh_start=True)
-    wall_s = time.perf_counter() - wall_start
+    clock = TrainingClock(now=lambda: fake_now[0])
+    runner.learn_for(clock, 2.5 * FAKE_ITERATION_S, FAKE_ITERATION_S, store, fresh_start=True)
 
-    assert len(busy) >= 2
-    # On the clock it would hold the busy-waits too, i.e. exceed wall time minus the busy-waits.
-    assert clock.elapsed_s <= wall_s - sum(busy)
+    assert saves == [0, 1, 2]  # one per mark crossed, the last at the budget
+    assert clock.elapsed_s == pytest.approx(3 * FAKE_ITERATION_S)  # on the clock it would add 3 * SAVE_COST_S
 
 
 @pytest.mark.usefixtures("torch_determinism")  # the assertion is bitwise parity of two runs
@@ -280,14 +279,14 @@ def test_hooks_run_in_order_off_the_clock(hooked_run: HookedRun) -> None:
 
 def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, store: CheckpointStore) -> None:
     _, first = build(name="first")
-    first.learn_for(TrainingClock(), 2.0, 1.0, store, fresh_start=True)
+    first.learn_for(TrainingClock(now=Ticker(TICK_S)), 2.0, 1.0, store, fresh_start=True)
     loaded = expect(store.latest(), "first run saved no checkpoint")
     before = {ref.path.name for ref in store.list()}
 
     resumed_env, resumed = build(name="resumed")
     infos = resumed.load(str(loaded.path))
     restored_steps = resumed_env.common_step_counter
-    clock = TrainingClock.from_state_dict(infos["clock"])
+    clock = TrainingClock.from_state_dict(infos["clock"], now=Ticker(TICK_S))
     restored_s = clock.elapsed_s
     result = resumed.learn_for(clock, restored_s + 1.5, 1.0, store, fresh_start=False)
 
@@ -306,7 +305,26 @@ def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, sto
 
 STEP_COST_S = 1.0  # fake seconds each env.step takes
 UPDATE_COST_S = 1000.0  # fake seconds each alg.update takes
+SAVE_COST_S = 100000.0  # fake seconds each checkpoint write takes (test_io_is_off_the_clock)
+FAKE_ITERATION_S = STEPS_PER_ITERATION * STEP_COST_S + UPDATE_COST_S
 SPLIT_ITERATIONS = 2
+
+
+def _advance_on_step_and_update(runner: Any) -> list[float]:
+    """Wrap the runner's env.step and alg.update so each advances a fake time; returns the [now] cell."""
+    fake_now = [0.0]
+    real_step, real_update = runner.env.step, runner.alg.update
+
+    def step(actions: torch.Tensor) -> Any:
+        fake_now[0] += STEP_COST_S
+        return real_step(actions)
+
+    def update() -> Any:
+        fake_now[0] += UPDATE_COST_S
+        return real_update()
+
+    runner.env.step, runner.alg.update = step, update
+    return fake_now
 
 
 @pytest.fixture(scope="module")
@@ -319,18 +337,7 @@ def split_clock(tmp_path_factory: pytest.TempPathFactory) -> Iterator[list[tuple
     root = tmp_path_factory.mktemp("split")
     env, runner = make_env_runner(root / "logs")
     try:
-        fake_now = [0.0]
-        real_step, real_update = runner.env.step, runner.alg.update
-
-        def step(actions: torch.Tensor) -> Any:
-            fake_now[0] += STEP_COST_S
-            return real_step(actions)
-
-        def update() -> Any:
-            fake_now[0] += UPDATE_COST_S
-            return real_update()
-
-        runner.env.step, runner.alg.update = step, update
+        fake_now = _advance_on_step_and_update(runner)
         clock = TrainingClock(now=lambda: fake_now[0])
         marks: list[tuple[str, float]] = []
         runner.learn_for(

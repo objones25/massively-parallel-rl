@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 import wandb
 from mjlab.envs import ManagerBasedRlEnv
-from support import APP_ENV_PREFIXES, LONG_S, NUM_ENVS, CompletedRun, make_env_runner, run_spec
+from support import APP_ENV_PREFIXES, LONG_S, NUM_ENVS, TICK_S, CompletedRun, Ticker, make_env_runner, run_spec
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
@@ -75,7 +75,11 @@ def g1_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> CheckpointRef:
 
 @pytest.fixture(scope="session")
 def completed_run_template(tmp_path_factory: pytest.TempPathFactory) -> CompletedRun:
-    """One real ``train_run(run_spec(2.0))`` with W&B offline. Never mutated: tests use ``completed_run``."""
+    """One real ``train_run(run_spec(2.0))`` with W&B offline. Never mutated: tests use ``completed_run``.
+
+    The training clock runs on a ``Ticker`` (one iteration = ``ITERATION_S``), so the run's cadence (iterations,
+    checkpoints) is the same on every machine; the training itself is real.
+    """
     base = tmp_path_factory.mktemp("completed")
     with pytest.MonkeyPatch.context() as mp:  # a session fixture runs before the per-test env cleanup
         for key in list(os.environ):
@@ -84,7 +88,8 @@ def completed_run_template(tmp_path_factory: pytest.TempPathFactory) -> Complete
         mp.setenv("WANDB_DIR", str(base / "wandbdir"))
         wandb.teardown()
         try:
-            state = train_run(run_spec(2.0), base / "volume", TrainDeps(publisher=None, wandb_mode="offline", device="cpu"))
+            deps = TrainDeps(publisher=None, wandb_mode="offline", device="cpu", now=Ticker(TICK_S))
+            state = train_run(run_spec(2.0), base / "volume", deps)
         finally:
             wandb.teardown()
     return CompletedRun(base / "volume", base / "wandbdir", state)

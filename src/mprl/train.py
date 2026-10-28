@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -63,6 +64,9 @@ class TrainDeps:
     # Diagnostics every 10 iterations: ~1 point per 5-10 s of training clock at 4096 envs, while the
     # extra activation forward pass and metric writes stay a small fraction of off-clock time.
     diagnostics_every_k: int = 10
+    # The training clock's time source (TrainingClock's ``now``). Tests inject a fake so a run's cadence does
+    # not depend on how fast the machine is; production keeps the default.
+    now: Callable[[], float] = time.perf_counter
 
 
 _SHA_RE: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")  # SHA-1 or SHA-256 object names
@@ -310,10 +314,10 @@ def _train(
     with built_runner(spec, deps.device, logger, paths.tensorboard_dir, params_dir=paths.run_dir / "params") as runner:
         sync = cuda_sync_for(deps.device)
         if latest is None:
-            clock = TrainingClock(sync=sync)
+            clock = TrainingClock(now=deps.now, sync=sync)
         else:
             infos = runner.load(str(latest.path))
-            clock = TrainingClock.from_state_dict(infos["clock"], sync=sync)
+            clock = TrainingClock.from_state_dict(infos["clock"], now=deps.now, sync=sync)
         if latest is not None and clock.elapsed_s >= budget_s:
             log.info("%s: checkpoint %s already covers the budget", spec.run_id, latest.path.name)
             onnx_error = export_onnx(runner, latest)

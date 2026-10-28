@@ -1,7 +1,8 @@
 """Smoke tests for train_run against real mjlab on CPU with 4 envs and W&B offline.
 
-One G1 flat iteration at 4 envs is about 0.5 s of training clock on this Mac, so budgets of 2-4 s run a
-handful of iterations. Checkpoints every 1 s of training clock (1/60 min).
+The training clock runs on a fake time source (support.Ticker): one iteration is exactly ITERATION_S = 0.5 s
+of training clock on any machine, so budgets of 2-4 s run 4-8 iterations. Checkpoints every 1 s of training
+clock (1/60 min). The SIGKILL test's child process keeps real time.
 
 Real training runs only where it is the behavior: the fresh run (the session ``completed_run_template``),
 a raised budget, the SIGKILL resume and the two post-training failures. Every other path starts from a
@@ -24,7 +25,7 @@ from unittest.mock import create_autospec
 import pytest
 import wandb
 from huggingface_hub import HfApi
-from support import EVERY_MIN, CompletedRun, run_spec, runpod_terminator
+from support import EVERY_MIN, ITERATION_S, TICK_S, CompletedRun, Ticker, run_spec, runpod_terminator
 
 import mprl.train as train_mod
 from mprl.checkpoints import CheckpointStore
@@ -40,7 +41,7 @@ from mprl.wandb_writer import ResumableWandbWriter
 
 pytestmark = [pytest.mark.smoke, pytest.mark.usefixtures("offline_wandb")]
 
-DEPS = TrainDeps(publisher=None, wandb_mode="offline", device="cpu")
+DEPS = TrainDeps(publisher=None, wandb_mode="offline", device="cpu", now=Ticker(TICK_S))
 REPO = "someone/mprl-test"
 SRC_DIR = Path(train_mod.__file__).resolve().parents[1]
 KILL_DEADLINE_S = 180.0  # mjlab import + env build + first checkpoint, generously
@@ -86,13 +87,15 @@ def test_fresh_run_completes_and_writes_state(completed_run_template: CompletedR
     assert state.status == "complete"
     assert state.run_id == spec.run_id
     assert state.config_hash == spec.config_hash()
-    assert state.train_seconds >= 2.0
+    assert state.train_seconds == pytest.approx(4 * ITERATION_S)  # the 4th iteration reaches the 2 s budget
     assert state.budget_minutes == spec.budget_minutes
     assert state.uploads == {}
     assert state.git_sha == train_mod.git_sha()
     assert load_state(paths.state_file) == state
     refs = CheckpointStore(paths.checkpoints_dir).list()
-    assert len(refs) >= 2
+    # Due at the 1 s mark (iteration 1 ends at 2 * ITERATION_S) and at the budget (iteration 3).
+    assert [r.iteration for r in refs] == [1, 3]
+    assert [r.train_seconds for r in refs] == pytest.approx([2 * ITERATION_S, 4 * ITERATION_S])
     assert (paths.checkpoints_dir / "checkpoints.onnx").is_file()
     assert {p.name for p in (paths.run_dir / "params").iterdir()} == {"env.yaml", "agent.yaml"}
     offline_runs = list((completed_run_template.wandb_dir / "wandb").glob(f"offline-run-*-{state.wandb_run_id}"))
@@ -229,7 +232,7 @@ def test_failed_upload_of_real_run_files_is_durable_before_terminate(
     publisher = HubPublisher(api, REPO, max_attempts=1, sleep=lambda _s: None)
 
     # complete without an "ok" upload: train_run only retries the upload (pinned in tests/unit/test_train_run.py)
-    state = train_run(spec, completed_run.volume, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu"))
+    state = train_run(spec, completed_run.volume, TrainDeps(publisher=publisher, wandb_mode="offline", device="cpu", now=Ticker(TICK_S)))
     finish_and_terminate([state], runpod_terminator(paths, events))
 
     final = expect(CheckpointStore(paths.checkpoints_dir).latest(), "no checkpoint")
