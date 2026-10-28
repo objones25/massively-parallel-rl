@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import wandb
@@ -94,3 +95,18 @@ def test_logger_cfg_shape() -> None:
         "resume_from_iteration": 3,
         "mode": "offline",
     }
+
+
+def test_store_config_accepts_real_mjlab_env_cfg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, build: Callable[..., tuple[object, Any]]
+) -> None:
+    """Real G1 env cfg (callables, class refs, nested configs) must survive the runner's init_logging_writer."""
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    try:
+        _, runner = build(logger=logger_cfg("mprl-tests", RUN_ID, "g", None, "offline"))
+        runner.logger.init_logging_writer()  # what learn_for does at start, with the runner's real env cfg
+        assert wandb.run is not None
+        assert "scene" in wandb.run.config["env_cfg"]
+        assert "algorithm" in wandb.run.config["train_cfg"]
+    finally:
+        wandb.finish()
