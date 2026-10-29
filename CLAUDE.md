@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Greenfield. As of 2026-10-27 the repo contains only two reference PDFs; no code, environment, or
-algorithm has been chosen yet. The **Commands** and **Architecture** sections below are placeholders
-to be filled in as decisions are made during brainstorming — update them in the same change that
-introduces the thing they describe. Do not document commands that do not exist yet.
+Code-complete for the paid session (2026-10-28): the `mprl` package, CPU test tiers, GPU tests, the RunPod image
+and CI exist on `feat/parallel-humanoid-walking`. Nothing has run on a GPU yet. The pod session (GPU tests,
+throughput, pilot, sweep, results) follows [`docs/runbook.md`](docs/runbook.md); record its measured numbers
+(steps/s per count, which counts fit, overhead, pilot metrics) here with their dates. Keep **Commands** and
+**Architecture** in step with the code, and do not document commands that do not exist.
 
 ## Goal
 
@@ -196,7 +197,8 @@ per fast test, 600 s per heavy test; the faulthandler exits after 900 s. Fast-ti
 (`support.Subprocesses`: posix_spawn-compatible launch, no stdin, bounded waits, terminate then kill on timeout). The smoke tier
 trains for real only where training is the behavior; inputs come from two session fixtures in
 `tests/smoke/conftest.py` (`g1_checkpoint`, `completed_run_template`), copied before any mutation. Shared helpers
-live in `tests/support.py` (`tests` is on pytest's pythonpath).
+live in `tests/support.py` (`tests` is on pytest's pythonpath). `tests/gpu` (skipped without CUDA): the clock's CUDA
+sync count, two PPO iterations at 4096 envs with finite losses, and a checkpoint round trip under `MPRL_VOLUME_ROOT`.
 
 `tests/smoke/test_mjlab_cpu.py` pins mjlab 1.6.0 env stepping and rendering on CPU with 4 envs; rsl_rl 5.4.2
 `learn`/`load` are pinned through our runner in `tests/smoke/test_timed_runner.py`. Verified 2026-10-27 on macOS
@@ -207,4 +209,58 @@ them. The fast tier needs no system libraries beyond the venv.
 
 ## Architecture
 
-*TBD — fill in once the environment, simulator, and algorithm are chosen.*
+Package `mprl` (`src/mprl/`) around mjlab's registered task `Mjlab-Velocity-Flat-Unitree-G1` and its shipped rsl_rl
+PPO config. Spec: `docs/superpowers/specs/2026-10-27-parallel-humanoid-walking-design.md`; plan:
+`docs/superpowers/plans/2026-10-27-parallel-humanoid-walking.md`; operating it: `docs/runbook.md`.
+
+| Module | Role |
+| --- | --- |
+| `cli.py` | tyro subcommands `setup preflight throughput train-run pilot sweep results`; loads `.env`; `_pod_guard` |
+| `config.py` | `RunSpec`, `SweepSpec` (counts, seeds, 45 min, 3 min checkpoints, long run), batch arithmetic, config hash |
+| `paths.py` | volume layout: `$MPRL_VOLUME_ROOT/sweeps/<sweep>/<run_id>/...`, `sweeps/<sweep>/results` |
+| `tasks.py` | the registered env / RL configs, mjlab imported lazily |
+| `clock.py` | `TrainingClock` (only time inside `measure()`, CUDA-synced), checkpoint-due rule |
+| `checkpoints.py` | `CheckpointStore`: atomic minute-stamped files, `latest`, `crossed(mark)` |
+| `timed_runner.py` | `TimedOnPolicyRunner.learn_for`: rsl_rl 5.4.2's `learn` on the clock, time-based checkpoints |
+| `diagnostics.py` | `Diag/*`: gradient, weight, update-ratio, activation, KL / clip fraction / explained variance |
+| `wandb_writer.py` | `ResumableWandbWriter` (rsl_rl `LogWriter`; fixed id, `resume_from` on resume) |
+| `train.py` | `train_run`: skip / resume / train / state / upload for one run; `built_runner`; `git_sha` |
+| `run_state.py` | `state.json` (atomic): status, W&B id, config hash, clock, git sha, upload outcomes |
+| `hub.py` | `HubPublisher`: Hugging Face repo + folder upload with bounded retry |
+| `runpod.py` | own pod id, `PodTerminator` (GET, DELETE, confirm gone) |
+| `publish.py` | ONNX export, `upload_run`, `PodGuard` (terminate on any exit), SIGTERM as `Terminated` |
+| `budget.py` | `Measurements`, cost estimate, cut order, `$40` cap |
+| `throughput.py` | steps/s, fit (CUDA OOM recorded), overhead and eval seconds per count |
+| `sweep.py` | exclusions, budget gate, pilot reuse, the runs then the long run |
+| `evaluator.py` | fixed-command offline evaluation (`EvalConfig`, `evaluate_checkpoint`, eval CSV) |
+| `render.py`, `race_video.py` | rollout frames for a checkpoint; side-by-side race video |
+| `curves.py`, `results.py`, `results_card.py` | seed aggregation and chart; results build and publish; model card |
+| `env_file.py`, `preflight.py` | `.env.example` / `.env`; setup checks (cuda, env, wandb, hf, runpod, volume) |
+| `errors.py`, `negative_space.py` | typed operating errors; `require` / `expect` / `check_*` |
+
+**Data flow.** `mprl sweep` (or `pilot`, `train-run`) builds the pod's `PodTerminator` first, then `run_sweep` /
+`run_pilot` call `train_run` per `RunSpec`. `train_run` reads `state.json`, builds the env and a fresh
+`TimedOnPolicyRunner` (`built_runner`), loads the latest checkpoint and the clock, and runs `learn_for` under the
+`TrainingClock`; checkpoints go to the `CheckpointStore`, metrics through rsl_rl's logger to the
+`ResumableWandbWriter`, `Diag/*` from `diagnostics` hooks off the clock. After the final checkpoint `publish`
+exports ONNX and `HubPublisher` uploads the run; `PodGuard` / `PodTerminator` delete the pod when the command
+ends, however it ends. `mprl results` runs the evaluator on the checkpoints at each mark, then `curves`,
+`race_video` and `results_card` build the CSV, chart, video and card, published to W&B and the Hub.
+
+**Fairness invariants** (spec §4, §9):
+
+- The clock counts only rollout + `compute_returns` and the PPO `update` (`timed_runner.py`, two `measure()`
+  blocks); checkpoint I/O, logging, diagnostics, evaluation, rendering and uploads are outside it. On CUDA it
+  synchronizes before each start and stop (`cuda_sync_for`). Resume restores it from the checkpoint.
+- Only `num_envs` and the seed differ between sweep runs: `resolve_cfgs` sets nothing else on the shipped configs,
+  and the config hash (all `RunSpec` fields but the budget) refuses a changed resume.
+- A mark takes the checkpoint that crossed it: the earliest in `[mark, mark + interval)`
+  (`CheckpointStore.crossed`), the single rule for evaluation marks, curve points and race-video frames.
+- The evaluator is identical for every N: play env, the same 6 pinned commands × 4 envs, seeds, 10 s horizon.
+
+**Image and venv model.** The image is `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` plus `/opt/venv`
+(`--system-site-packages`): torch, torchvision, triton and nvidia-* come from the base, everything else from
+`uv.lock` through `docker/uv-sync-base.sh` (the only sync; it skips `docker/base-provided-packages.txt`). The image
+sets `UV_NO_SYNC=1` so `uv run` never re-downloads the base's torch. The repo is cloned onto the volume
+(`/workspace/massively-parallel-rl`, where `.env` and the git sha live); `scripts/setup.sh` re-points the editable
+`mprl` install at that clone and must be re-run on every new pod.

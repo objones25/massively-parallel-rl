@@ -1,7 +1,9 @@
-"""GPU tier (``pytest -m gpu`` on the pod): the training clock synchronizes CUDA around every measured block.
+"""GPU tier (``pytest -m gpu`` on the pod): on ``cuda:0`` the training clock's sync is ``torch.cuda.synchronize``,
+and ``learn_for`` calls it before reading the start and the stop time of each of its two measured blocks.
 
-Without the synchronize, ``clock.measure()`` would stop while kernels are still queued and the clock
-would under-count GPU training time, unfairly for whichever env count queues the most work.
+It wraps the real ``cuda_sync_for("cuda:0")`` in a counter and runs two real G1 iterations at 64 envs. It checks how
+often the sync runs, not that it drains the queue (that is ``torch.cuda.synchronize``'s contract). Without it a
+measured block could stop the clock while its kernels are still queued, so GPU training time would be under-counted.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from support import LONG_S
 
 from mprl.checkpoints import CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
@@ -22,7 +25,6 @@ pytestmark = [
 ]
 
 DEVICE = "cuda:0"
-LONG_S = 3600.0
 ITERATIONS = 2
 MEASURES_PER_ITERATION = 2  # rollout + compute_returns, then the PPO update
 SYNCS_PER_MEASURE = 2  # before the start time and before the stop time
