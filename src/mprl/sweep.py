@@ -21,7 +21,8 @@
    the run is skipped. When no reuse is accepted, a ``pilot_reuse.json`` left by an earlier
    invocation is removed, since that run now trains for real.
 4. Every remaining run trains through ``train_run`` (count-major), then the long run, which resumes
-   the pilot, inside a ``PodGuard``: a crash still terminates the pod, then re-raises (a failed
+   the pilot, inside a ``PodGuard``; ``release_device_memory`` runs after each one (the finished
+   runner/env is a gc-only cycle holding GPU memory): a crash still terminates the pod, then re-raises (a failed
    termination is attached to it as a note).
 
 Refusing the confirmation or exceeding the cap returns or raises *before* any training and leaves the
@@ -43,7 +44,7 @@ from mprl.negative_space import require
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.publish import PodGuard
 from mprl.run_state import RunState, load_state, write_json_atomic
-from mprl.train import git_sha, train_run
+from mprl.train import git_sha, release_device_memory, train_run
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -97,6 +98,7 @@ def run_pilot(sweep: SweepSpec, root: Path, deps: TrainDeps, *, terminator: PodT
     """Train the pilot, then terminate the pod through ``PodGuard`` (also on a crash, which re-raises)."""
     with PodGuard(terminator, interactive=False) as guard:
         guard.states.append(train_run(pilot_spec(sweep), root, deps))
+        release_device_memory(deps.device)
     return guard.states[0]
 
 
@@ -156,6 +158,7 @@ def run_sweep(
     with PodGuard(terminator, interactive=False) as guard:
         for spec in specs:
             guard.states.append(train_run(spec, root, deps))
+            release_device_memory(deps.device)  # the finished runner/env cycle, before the next env is built
     return guard.states
 
 

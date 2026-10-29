@@ -4,6 +4,7 @@ tests/smoke/test_train_run.py) and an autospecced ``PodTerminator``."""
 from __future__ import annotations
 
 import json
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -388,3 +389,58 @@ def test_sweep_manifest_records_the_price(tmp_path: Path, train_run: MagicMock) 
     manifest = json.loads((sweep_results_dir(tmp_path, "main") / "sweep_manifest.json").read_text())
     assert manifest["price_per_hour"] == pytest.approx(2.5)
     assert manifest["estimate"]["usd"] == pytest.approx(manifest["estimate"]["hours"] * 2.5)
+
+
+class _Runner:
+    """Stands in for a finished run's runner: a reference cycle (mjlab managers point back at the env)."""
+
+    def __init__(self) -> None:
+        self.cycle = self
+
+
+def test_device_memory_is_released_after_every_run_in_order(
+    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, str]] = []
+    train_run.side_effect = lambda spec, *_: events.append(("train", spec.run_id)) or _state(spec)
+    release = create_autospec(mprl.train.release_device_memory, side_effect=lambda d: events.append(("release", d)))
+    monkeypatch.setattr(sweep_mod, "release_device_memory", release)
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=False)
+
+    trained = [run_id for kind, run_id in events if kind == "train"]
+    assert len(trained) == len(SMALL.runs()) + 1
+    assert events == [e for run_id in trained for e in (("train", run_id), ("release", "cpu"))]
+
+
+def test_finished_runner_has_no_live_reference_when_memory_is_released(
+    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refs: list[weakref.ref[_Runner]] = []
+    alive_after_collect: list[bool] = []
+
+    def train(spec: RunSpec, *_args: object) -> RunState:
+        refs.append(weakref.ref(_Runner()))  # only gc can free it, as the real runner/env cycle
+        return _state(spec)
+
+    def release(device: str) -> None:
+        mprl.train.release_device_memory(device)
+        alive_after_collect.append(refs[-1]() is not None)
+
+    train_run.side_effect = train
+    monkeypatch.setattr(sweep_mod, "release_device_memory", release)
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=False)
+
+    assert alive_after_collect == [False] * (len(SMALL.runs()) + 1)
+
+
+def test_pilot_releases_device_memory_after_training(
+    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = create_autospec(mprl.train.release_device_memory)
+    monkeypatch.setattr(sweep_mod, "release_device_memory", release)
+
+    sweep_mod.run_pilot(SMALL, tmp_path, DEPS, terminator=None)
+
+    release.assert_called_once_with("cpu")

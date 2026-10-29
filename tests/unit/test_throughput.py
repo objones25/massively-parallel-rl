@@ -73,7 +73,7 @@ def test_memory_released_after_oom_frame_is_gone(tmp_path: Path, monkeypatch: py
 
     monkeypatch.setattr(throughput_mod, "measure_count", create_autospec(throughput_mod.measure_count, side_effect=oom))
     monkeypatch.setattr(
-        throughput_mod, "_release_device_memory", lambda _device: alive_at_release.append(refs[-1]() is not None)
+        throughput_mod, "release_device_memory", lambda _device: alive_at_release.append(refs[-1]() is not None)
     )
 
     m = measure_throughput((4, 8), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)

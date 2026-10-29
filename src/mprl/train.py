@@ -19,6 +19,7 @@ Control flow of ``train_run`` (all paths under ``RunPaths(root, spec)``):
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
@@ -29,6 +30,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+
+import torch
 
 from mprl import diagnostics
 from mprl.checkpoints import CheckpointRef, CheckpointStore
@@ -257,6 +260,20 @@ def built_runner(
         yield TimedOnPolicyRunner(wrapped, agent_cfg, str(log_dir), device)
     finally:
         env.close()
+
+
+def release_device_memory(device: str) -> None:
+    """Free a finished run's device memory before the next one builds its env.
+
+    mjlab's managers point back at their env, so a finished runner/env is a reference cycle only ``gc`` frees
+    (``env.close()`` frees nothing on the GPU, and mjlab suspends gc while it captures CUDA graphs); then the
+    caching allocator returns the freed blocks. Off the training clock. The caller must hold no reference to
+    the runner (nor an exception whose traceback pins its frames).
+    """
+    require(device == "cpu" or device.startswith("cuda"), f"unsupported device {device!r}")
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
 
 
 def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:

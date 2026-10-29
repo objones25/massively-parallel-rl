@@ -25,7 +25,6 @@ are included too, so it errs high).
 
 from __future__ import annotations
 
-import gc
 import logging
 import time
 from dataclasses import dataclass
@@ -40,7 +39,7 @@ from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import RunSpec
 from mprl.evaluator import EvalConfig, evaluate_checkpoint
 from mprl.negative_space import check_finite, expect, require
-from mprl.train import TrainDeps, built_runner
+from mprl.train import TrainDeps, built_runner, release_device_memory
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -133,12 +132,6 @@ def measure_eval_seconds(work_dir: Path, num_envs: int, device: str, cfg: EvalCo
     return time.perf_counter() - start
 
 
-def _release_device_memory(device: str) -> None:
-    gc.collect()
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
-
-
 def measure_throughput(
     env_counts: Sequence[int],
     iterations: int,
@@ -164,7 +157,7 @@ def measure_throughput(
         # Released only here: inside the except, error.__traceback__ still pins the failed run's frames
         # (runner, policy, rollout tensors), so nothing could be freed. Python drops `error` at the
         # end of the except block.
-        _release_device_memory(device)
+        release_device_memory(device)
         fits[n] = measured is not None
         if measured is None:
             continue
