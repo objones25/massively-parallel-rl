@@ -15,11 +15,11 @@ import mprl.sweep as sweep_mod
 import mprl.train
 from mprl.budget import CostEstimate, Measurements
 from mprl.config import RunSpec, SweepSpec
-from mprl.errors import EnvDoesNotFit, MeasurementMissing, TerminateFailed
+from mprl.errors import EnvDoesNotFit, InvalidInput, MeasurementMissing, TerminateFailed
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.run_state import RunState, save_state
 from mprl.runpod import PodTerminator
-from mprl.sweep import pilot_spec, run_sweep
+from mprl.sweep import configured_sweep, pilot_spec, run_sweep
 from mprl.train import TrainDeps
 
 SHA = "a" * 40
@@ -319,3 +319,72 @@ def test_failed_pilot_termination_does_not_mask_the_training_error(
         sweep_mod.run_pilot(SMALL, tmp_path, DEPS, terminator=terminator)
 
     assert any("TerminateFailed: DELETE failed with HTTP 500" in note for note in info.value.__notes__)
+
+
+def test_configured_sweep_applies_the_overrides() -> None:
+    sweep = configured_sweep("main", seeds=(0, 2), budget_minutes=60.0, long_run_minutes=90.0)
+
+    assert sweep == SweepSpec("main", seeds=(0, 2), budget_minutes=60.0, long_run_minutes=90.0)
+
+
+def test_configured_sweep_defaults_are_the_sweep_spec() -> None:
+    defaults = SweepSpec("main")
+
+    sweep = configured_sweep(
+        "main", seeds=defaults.seeds, budget_minutes=defaults.budget_minutes, long_run_minutes=defaults.long_run_minutes
+    )
+
+    assert sweep == defaults
+
+
+@pytest.mark.parametrize(
+    ("seeds", "budget", "long_run", "match"),
+    [
+        ((), 45.0, 180.0, r"^--seeds must name at least one seed"),
+        ((0, 0), 45.0, 180.0, r"^--seeds must not repeat a seed"),
+        ((-1,), 45.0, 180.0, r"^--seeds must be non-negative"),
+        ((0,), 2.0, 180.0, r"^--budget-minutes must be a finite number of at least 3"),
+        ((0,), float("nan"), 180.0, r"^--budget-minutes must be a finite number of at least 3"),
+        ((0,), 45.0, 30.0, r"^--long-run-minutes must be a finite number of at least 45"),
+        ((0,), 45.0, float("inf"), r"^--long-run-minutes must be a finite number of at least 45"),
+    ],
+)
+def test_configured_sweep_rejects_bad_overrides(
+    seeds: tuple[int, ...], budget: float, long_run: float, match: str
+) -> None:
+    with pytest.raises(InvalidInput, match=match):
+        configured_sweep("main", seeds=seeds, budget_minutes=budget, long_run_minutes=long_run)
+
+
+def test_pilot_reuse_unaffected_by_price_seed_and_long_run_options(tmp_path: Path, train_run: MagicMock) -> None:
+    """Only run selection and cost change; the n=4096 s=0 run's hash (budget excluded) still equals the pilot's."""
+    adapted = replace(SMALL, seeds=(0, 2), long_run_minutes=90.0)
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+
+    run_sweep(adapted, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True, price_per_hour=2.49)
+
+    assert _reused_id() not in _trained(train_run)
+    assert (sweep_results_dir(tmp_path, "main") / "pilot_reuse.json").is_file()
+    assert _trained(train_run) == [
+        RunSpec("main", 64, 0, 45.0).run_id,
+        RunSpec("main", 64, 2, 45.0).run_id,
+        RunSpec("main", 4096, 2, 45.0).run_id,
+        SMALL.long_run().run_id,
+    ]
+
+
+def test_pilot_not_reused_when_the_sweep_budget_exceeds_the_pilot(tmp_path: Path, train_run: MagicMock) -> None:
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+
+    run_sweep(replace(SMALL, budget_minutes=60.0), tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    assert RunSpec("main", 4096, 0, 60.0).run_id in _trained(train_run)
+    assert not (sweep_results_dir(tmp_path, "main") / "pilot_reuse.json").exists()
+
+
+def test_sweep_manifest_records_the_price(tmp_path: Path, train_run: MagicMock) -> None:
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=False, price_per_hour=2.5)
+
+    manifest = json.loads((sweep_results_dir(tmp_path, "main") / "sweep_manifest.json").read_text())
+    assert manifest["price_per_hour"] == pytest.approx(2.5)
+    assert manifest["estimate"]["usd"] == pytest.approx(manifest["estimate"]["hours"] * 2.5)

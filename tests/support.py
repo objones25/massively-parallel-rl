@@ -6,7 +6,7 @@ Only constants, plain functions and types live here; fixtures stay in the confte
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import IO, Any
@@ -21,6 +21,8 @@ from mprl.runpod import PodTerminator
 
 # Environment variable prefixes owned by the project; tests/conftest.py strips them before every test.
 APP_ENV_PREFIXES = ("MPRL_", "WANDB_", "HF_", "RUNPOD_")
+# Service credentials a test marked ``network`` keeps: it talks to the real W&B, Hugging Face and RunPod.
+NETWORK_ENV_PREFIXES = ("WANDB_", "HF_", "RUNPOD_")
 DEFAULT_MARKEXPR = "not smoke and not network and not gpu"  # must equal the -m in pyproject addopts
 POD = "abc123podid"
 
@@ -45,6 +47,15 @@ class Ticker:
     def __call__(self) -> float:
         self._t += self._step
         return self._t
+
+
+def app_env_to_strip(keys: Iterable[str], node: Any) -> list[str]:
+    """The keys, in order, that the root conftest's ``_clean_env`` removes before the test ``node`` runs.
+
+    Every app variable (``APP_ENV_PREFIXES``), except that a test marked ``network`` keeps ``NETWORK_ENV_PREFIXES``.
+    """
+    keep = NETWORK_ENV_PREFIXES if node.get_closest_marker("network") is not None else ()
+    return [k for k in keys if k.startswith(APP_ENV_PREFIXES) and not k.startswith(keep)]
 
 
 def run_spec(budget_s: float, *, every_minutes: float = EVERY_MIN, num_envs: int = NUM_ENVS, seed: int = 0) -> RunSpec:

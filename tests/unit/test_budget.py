@@ -9,13 +9,14 @@ import pytest
 from mprl.budget import (
     CUT_ORDER,
     Measurements,
+    check_price,
     estimate,
     load_measurements,
     plan_within_budget,
     save_measurements,
 )
 from mprl.config import SweepSpec
-from mprl.errors import BudgetExceeded, MeasurementsCorrupt, MprlOperatingError
+from mprl.errors import BudgetExceeded, InvalidInput, MeasurementsCorrupt, MprlOperatingError
 
 COUNTS = (64, 256, 1024, 4096, 16384)
 
@@ -151,3 +152,29 @@ def test_fully_cut_sweep_exactly_at_the_cap_is_accepted() -> None:
     assert cuts == CUT_ORDER
     assert planned == cut_out
     assert sweep.env_counts == (64, 256, 1024, 4096)
+
+
+def test_plan_within_budget_costs_at_the_given_price() -> None:
+    """18.5 h x $2.20 = $40.70 is over the cap; with no eval time only long_run_half saves money: 17 h x $2.20."""
+    sweep, cuts, est = plan_within_budget(SweepSpec("main"), _m(), price_per_hour=2.2)
+
+    assert cuts == ("eval_every_6min", "long_run_half")
+    assert sweep.long_run_minutes == pytest.approx(90.0)
+    assert est.total_usd == pytest.approx(17.0 * 2.2)
+
+
+def test_plan_within_budget_defaults_to_the_spec_price() -> None:
+    _, cuts, est = plan_within_budget(SweepSpec("main"), _m())
+
+    assert cuts == ()
+    assert est.total_usd == pytest.approx(18.5 * 1.79)
+
+
+def test_check_price_returns_a_valid_price() -> None:
+    assert check_price(2.49) == pytest.approx(2.49)
+
+
+@pytest.mark.parametrize("price", [0.0, -1.79, float("nan"), float("inf")])
+def test_check_price_rejects_non_positive_or_non_finite(price: float) -> None:
+    with pytest.raises(InvalidInput, match=r"^--price-per-hour must be a positive finite number"):
+        check_price(price)

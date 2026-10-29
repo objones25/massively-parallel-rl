@@ -22,7 +22,7 @@ import math
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Final
 
-from mprl.errors import BudgetExceeded, MeasurementsCorrupt
+from mprl.errors import BudgetExceeded, InvalidInput, MeasurementsCorrupt
 from mprl.negative_space import CheckFailed, check_finite, require
 from mprl.run_state import write_json_atomic
 
@@ -69,6 +69,13 @@ class CostEstimate:
         price = self.total_usd / self.total_hours if self.total_hours > 0 else 0.0
         rows = [f"  {hours:7.3f} h  ${hours * price:7.2f}  {item}" for item, hours in self.lines]
         return "\n".join([*rows, f"  {self.total_hours:7.3f} h  ${self.total_usd:7.2f}  total"])
+
+
+def check_price(price_per_hour: float) -> float:
+    """``price_per_hour`` if it is a positive finite number; ``InvalidInput`` (it comes from the command line) otherwise."""
+    if not (math.isfinite(price_per_hour) and price_per_hour > 0.0):
+        raise InvalidInput(f"--price-per-hour must be a positive finite number of dollars, got {price_per_hour}")
+    return price_per_hour
 
 
 def save_measurements(path: Path, m: Measurements) -> None:
@@ -160,16 +167,16 @@ _CUTS: Final[dict[str, Callable[[SweepSpec], SweepSpec]]] = {
 
 
 def plan_within_budget(
-    sweep: SweepSpec, m: Measurements, cap_usd: float = CAP_USD
+    sweep: SweepSpec, m: Measurements, cap_usd: float = CAP_USD, *, price_per_hour: float = PRICE_PER_HOUR
 ) -> tuple[SweepSpec, tuple[str, ...], CostEstimate]:
-    """Apply ``CUT_ORDER`` one cut at a time until the estimate is within ``cap_usd``.
+    """Apply ``CUT_ORDER`` one cut at a time until the estimate at ``price_per_hour`` is within ``cap_usd``.
 
     A cut that would not change the sweep (16384 already absent, fewer than 3 seeds) is not applied
     or reported. Raises ``BudgetExceeded`` with the final estimate if every cut is not enough.
     """
     require(tuple(_CUTS) == CUT_ORDER, "cut table out of sync with CUT_ORDER")
     require(NEVER_DROPPED in sweep.env_counts, f"sweep {sweep.name} lacks the {NEVER_DROPPED}-env count")
-    est = estimate(sweep, m)
+    est = estimate(sweep, m, price_per_hour)
     applied: list[str] = []
     for name in CUT_ORDER:
         if est.total_usd <= cap_usd:
@@ -179,7 +186,7 @@ def plan_within_budget(
             continue
         sweep = cut
         applied.append(name)
-        est = estimate(sweep, m)
+        est = estimate(sweep, m, price_per_hour)
     require(NEVER_DROPPED in sweep.env_counts, f"a cut removed the {NEVER_DROPPED}-env count")
     if est.total_usd > cap_usd:
         raise BudgetExceeded(

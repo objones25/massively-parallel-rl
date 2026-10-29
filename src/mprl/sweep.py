@@ -6,12 +6,13 @@
    Counts with ``m.fits[n] is False`` are removed and the reason (CUDA OOM, plus the steps/s measured
    for the counts that fit) is recorded in ``sweep_results_dir/sweep_manifest.json``. If 64 or the
    long-run count does not fit, ``EnvDoesNotFit`` is raised instead.
-2. ``plan_within_budget`` applies the cut order; the estimate is printed. If any cut was applied,
+2. ``plan_within_budget`` applies the cut order at ``price_per_hour`` (``--price-per-hour``); the estimate is
+   printed and the price recorded in the manifest. If any cut was applied,
    ``confirm(estimate, cuts)`` must return True, else nothing trains and ``[]`` is returned. The
    estimate counts the whole project (setup and the pilot's 45 minutes included), because the $40
    cap is on total spend; it also still counts a reused pilot run, so it errs high.
 3. With ``reuse_pilot``, the pilot (``pilot_spec``: the long run's first 45 minutes) stands in for the
-   sweep's ``n=long_run_envs, s=0`` run when (a) HEAD is known and equals the pilot's ``git_sha`` and
+   sweep's ``n=long_run_envs, s=0`` run when the sweep's budget is at most 45 minutes and (a) HEAD is known and equals the pilot's ``git_sha`` and
    the sha the sweep was first started on, (b) the pilot's ``config_hash`` equals that sweep run's hash
    with the sweep name substituted (every field but the sweep name and budget equal), and (c) the
    pilot is ``complete`` with at least 45 training minutes, or this same reuse was already recorded
@@ -31,11 +32,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any, Final
 
-from mprl.budget import NEVER_DROPPED, CostEstimate, Measurements, plan_within_budget
-from mprl.errors import EnvDoesNotFit, MeasurementMissing
+from mprl.budget import NEVER_DROPPED, PRICE_PER_HOUR, CostEstimate, Measurements, plan_within_budget
+from mprl.config import SweepSpec
+from mprl.errors import EnvDoesNotFit, InvalidInput, MeasurementMissing
 from mprl.negative_space import require
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.publish import PodGuard
@@ -46,7 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from mprl.config import RunSpec, SweepSpec
+    from mprl.config import RunSpec
     from mprl.runpod import PodTerminator
     from mprl.train import TrainDeps
 
@@ -56,6 +59,33 @@ PILOT_MINUTES: Final = 45.0
 _UNKNOWN_SHA: Final = "unknown"  # git_sha() without git or a checkout
 _MANIFEST: Final = "sweep_manifest.json"
 _PILOT_REUSE: Final = "pilot_reuse.json"
+
+
+def configured_sweep(
+    name: str, *, seeds: tuple[int, ...], budget_minutes: float, long_run_minutes: float
+) -> SweepSpec:
+    """``SweepSpec(name)`` with the command line's overrides; ``InvalidInput`` naming the option for a bad value.
+
+    The budget must cover one checkpoint interval; the long run must cover the pilot it resumes.
+    """
+    every = SweepSpec(name).checkpoint_every_minutes
+    if not seeds:
+        raise InvalidInput("--seeds must name at least one seed")
+    if len(set(seeds)) != len(seeds):
+        raise InvalidInput(f"--seeds must not repeat a seed, got {list(seeds)}")
+    if any(seed < 0 for seed in seeds):
+        raise InvalidInput(f"--seeds must be non-negative, got {list(seeds)}")
+    if not (math.isfinite(budget_minutes) and budget_minutes >= every):
+        raise InvalidInput(
+            f"--budget-minutes must be a finite number of at least {every:g} (one checkpoint interval), "
+            f"got {budget_minutes}"
+        )
+    if not (math.isfinite(long_run_minutes) and long_run_minutes >= PILOT_MINUTES):
+        raise InvalidInput(
+            f"--long-run-minutes must be a finite number of at least {PILOT_MINUTES:g} (the pilot it resumes), "
+            f"got {long_run_minutes}"
+        )
+    return replace(SweepSpec(name), seeds=seeds, budget_minutes=budget_minutes, long_run_minutes=long_run_minutes)
 
 
 def pilot_spec(sweep: SweepSpec) -> RunSpec:
@@ -79,6 +109,7 @@ def run_sweep(
     confirm: Callable[[CostEstimate, tuple[str, ...]], bool],
     terminator: PodTerminator | None,
     reuse_pilot: bool,
+    price_per_hour: float = PRICE_PER_HOUR,
 ) -> list[RunState]:
     """Run ``sweep`` within the budget (steps in the module docstring); the states of the runs trained."""
     results = sweep_results_dir(root, sweep.name)
@@ -86,7 +117,7 @@ def run_sweep(
     prior = _read_json(results / _MANIFEST)
     started_sha = prior.get("git_sha", sha)
     fitting, excluded = _exclude_unfit(sweep, m)
-    planned, cuts, est = plan_within_budget(fitting, m)
+    planned, cuts, est = plan_within_budget(fitting, m, price_per_hour=price_per_hour)
     print(f"sweep {sweep.name}: estimated cost (cuts: {', '.join(cuts) or 'none'})\n{est.describe()}")
     if cuts and not confirm(est, cuts):
         log.info("sweep %s: cuts %s not confirmed; nothing trained", sweep.name, cuts)
@@ -107,6 +138,7 @@ def run_sweep(
             "cuts": list(cuts),
             "estimate": {"lines": [list(line) for line in est.lines], "hours": est.total_hours, "usd": est.total_usd},
             "measurements": asdict(m),
+            "price_per_hour": price_per_hour,
             "git_sha": started_sha,
             "pilot_reuse_rejected": rejected,
         },
@@ -172,7 +204,9 @@ def _pilot_reuse(planned: SweepSpec, root: Path, sha: str, started_sha: str) -> 
     state = load_state(paths.state_file)
     recorded = _read_json(sweep_results_dir(root, planned.name) / _PILOT_REUSE).get(target.run_id) == entry
     reason = ""
-    if sha == _UNKNOWN_SHA:
+    if planned.budget_minutes > PILOT_MINUTES:
+        reason = f"the sweep's {planned.budget_minutes:g} min budget is longer than the pilot's {PILOT_MINUTES:g} min"
+    elif sha == _UNKNOWN_SHA:
         reason = "HEAD is unknown, so the code cannot be shown unchanged"
     elif started_sha != sha:
         reason = f"the sweep started on {started_sha[:12]} but HEAD is {sha[:12]}"

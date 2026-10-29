@@ -31,7 +31,7 @@ import tyro
 from dotenv import dotenv_values, load_dotenv
 from huggingface_hub import HfApi
 
-from mprl.budget import CostEstimate, load_measurements, save_measurements
+from mprl.budget import PRICE_PER_HOUR, CostEstimate, check_price, load_measurements, save_measurements
 from mprl.config import RunSpec, SweepSpec
 from mprl.curves import METRICS
 from mprl.env_file import parse_env_example, prompt_values, render_env, write_env
@@ -44,7 +44,7 @@ from mprl.preflight import default_checks, run_checks
 from mprl.publish import PodGuard, sigterm_raises
 from mprl.results import build_results
 from mprl.runpod import own_terminator
-from mprl.sweep import run_pilot, run_sweep
+from mprl.sweep import PILOT_MINUTES, configured_sweep, run_pilot, run_sweep
 from mprl.throughput import measure_eval_seconds, measure_throughput
 from mprl.train import TrainDeps, train_run
 
@@ -58,6 +58,7 @@ _RUNPOD_TIMEOUT_S: Final = 30.0
 _DEVICE: Final = "cuda:0" if torch.cuda.is_available() else "cpu"
 _NO_TERMINATE_HINT: Final = "refusing to start without auto-termination; pass --no-terminate to keep the pod running"
 
+_SWEEP_DEFAULTS: Final = SweepSpec("main")  # the defaults of every sweep option (name excluded)
 WandbMode = Literal["online", "offline", "disabled"]
 Metric = Literal["vel_error_xy", "vel_error_yaw", "no_fall_fraction", "mean_time_to_fall_s", "mean_tracking_reward"]
 METRIC_CHOICES: Final[tuple[str, ...]] = get_args(Metric)
@@ -194,11 +195,19 @@ class Pilot:
 
     name: str = "main"
     """Sweep the pilot belongs to (``sweep --reuse-pilot`` with the same name can reuse it)."""
+    price_per_hour: float = PRICE_PER_HOUR
+    """GPU price in $/h for the printed cost (read it from RunPod before starting)."""
     no_terminate: bool = False
     device: str = _DEVICE
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
+        price = check_price(self.price_per_hour)
+        envs = SweepSpec(self.name).long_run_envs
+        print(
+            f"pilot: {PILOT_MINUTES:g} training minutes at {envs} envs, ${PILOT_MINUTES / 60.0 * price:.2f} "
+            f"at ${price:.2f}/h before off-clock overhead"
+        )
         with _pod_guard(self.no_terminate) as guard:
             deps = _deps(self.device, self.wandb_mode)
             guard.states.append(run_pilot(SweepSpec(self.name), volume_root(os.environ), deps, terminator=None))
@@ -223,6 +232,12 @@ class Sweep:
     name: str
     reuse_pilot: bool = False
     """Let a complete pilot on the same code stand in for the long-run count's seed-0 run."""
+    price_per_hour: float = PRICE_PER_HOUR
+    """GPU price in $/h for the estimate and the $40 cap check (read it from RunPod before starting)."""
+    seeds: tuple[int, ...] = _SWEEP_DEFAULTS.seeds
+    budget_minutes: float = _SWEEP_DEFAULTS.budget_minutes
+    """Training-clock minutes per sweep run (above 45 the pilot cannot stand in for a run)."""
+    long_run_minutes: float = _SWEEP_DEFAULTS.long_run_minutes
     no_terminate: bool = False
     yes: bool = False
     """Accept the budget cuts without asking (they are printed first)."""
@@ -230,19 +245,24 @@ class Sweep:
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
+        price = check_price(self.price_per_hour)
+        sweep = configured_sweep(
+            self.name, seeds=self.seeds, budget_minutes=self.budget_minutes, long_run_minutes=self.long_run_minutes
+        )
         root = volume_root(os.environ)
         with _pod_guard(self.no_terminate) as guard:
             deps = _deps(self.device, self.wandb_mode)
             if not (root / MEASUREMENTS).is_file():
                 raise MeasurementMissing(f"{root / MEASUREMENTS} does not exist; run `mprl throughput` first")
             guard.states += run_sweep(
-                SweepSpec(self.name),
+                sweep,
                 root,
                 deps,
                 load_measurements(root / MEASUREMENTS),
                 confirm=lambda est, cuts: _confirm(est, cuts, yes=self.yes),
                 terminator=None,  # the guard terminates, once, on every exit
                 reuse_pilot=self.reuse_pilot,
+                price_per_hour=price,
             )
             if not guard.states:
                 print(f"sweep {self.name}: cuts not confirmed; nothing trained")

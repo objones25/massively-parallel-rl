@@ -14,7 +14,7 @@ from mprl.preflight import check_hf, check_runpod, check_wandb
 
 pytestmark = pytest.mark.network
 
-# Read at import: the autouse _clean_env fixture removes WANDB_/HF_/RUNPOD_ variables before each test.
+# Network tests keep WANDB_/HF_/RUNPOD_ (tests/conftest.py _clean_env); RUNPOD_POD_ID may be exported by hand.
 _ENV = dict(os.environ)
 
 

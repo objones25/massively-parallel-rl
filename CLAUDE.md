@@ -84,7 +84,7 @@ uv run pytest                                        # fast tier only (~10 s): n
 uv run pytest tests/unit/test_clock.py::test_name -v # one test
 uv run pytest -m smoke -p no:randomly                # heavy tier (~2 min CPU): real mjlab/rsl_rl, training, W&B offline, ffmpeg
 uv run pytest -m smoke tests/smoke/test_render.py::test_render_rollout_cpu   # one smoke test: still needs -m smoke
-uv run pytest -m network                             # real W&B / HF / RunPod (needs keys in the environment)
+uv run pytest -m network                             # real W&B / HF / RunPod; network tests keep WANDB_/HF_/RUNPOD_ from the environment
 uv run pytest -m gpu                                 # CUDA tests (on the pod, where the image's UV_NO_SYNC=1 stops uv run syncing)
 uv run pytest -p randomly -n auto                    # random order, parallel
 uv run pytest -m "not network and not gpu" --cov --cov-branch --cov-report=xml --cov-fail-under=80   # CI: fast + smoke, coverage floor
@@ -114,13 +114,17 @@ scripts/setup.sh --allow-no-volume --cpu             # local testing: no mount c
 scripts/train.sh                                     # = mprl sweep --name main
 scripts/train.sh preflight [--cpu] [--only env volume ...]           # PASS/FAIL per check; exit 1 on any FAIL
 scripts/train.sh throughput --counts 64 256 1024 4096 16384          # writes $MPRL_VOLUME_ROOT/measurements.json
-scripts/train.sh pilot                                               # long run's first 45 min, then terminates the pod
+scripts/train.sh pilot [--price-per-hour 1.79]                      # long run's first 45 min, then terminates the pod
 scripts/train.sh sweep --name main --reuse-pilot [--yes]             # --yes accepts budget cuts unattended
+scripts/train.sh sweep --name main --price-per-hour 2.49 --seeds 0 1 --budget-minutes 67 --long-run-minutes 180
 scripts/train.sh train-run --sweep dbg --num-envs 64 --seed 0 --minutes 3 --no-terminate
 scripts/train.sh results --name main --primary-metric vel_error_xy   # off the clock; --terminate to delete the pod after
 ```
 
-`train-run`, `pilot` and `sweep` resolve the pod id and build the terminator before training, and refuse
+`--price-per-hour` (default 1.79) feeds the estimate and the $40 cap; `--seeds`, `--budget-minutes` and
+`--long-run-minutes` override `SweepSpec` without a code change (a code change after the pilot changes the git sha
+and voids pilot reuse; a budget over 45 min also voids it). Bad values exit 1 with `InvalidInput` before the pod
+guard, so the pod stays up. `train-run`, `pilot` and `sweep` resolve the pod id and build the terminator before training, and refuse
 without `RUNPOD_API_KEY` or a pod id unless `--no-terminate` is given. All take `--device` (default `cuda:0`
 when available) and `--wandb-mode online|offline|disabled`.
 

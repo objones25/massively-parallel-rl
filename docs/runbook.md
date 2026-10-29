@@ -38,9 +38,10 @@ is over $40 it applies cuts in this order and asks you to confirm:
 
 The 64-env count is never dropped. If every cut is not enough, the sweep refuses to start (`BudgetExceeded`).
 
-The price is a constant, `PRICE_PER_HOUR = 1.79` in `src/mprl/budget.py`. If the A100 price you read differs, tell
-the builder before session A. Editing the code after the pilot changes the git sha, and then the pilot can no
-longer stand in for a sweep run.
+The price defaults to $1.79/h (`PRICE_PER_HOUR` in `src/mprl/budget.py`). If the A100 price you read differs, pass
+it on the command line, `--price-per-hour <price>`, to both `pilot` (its printed cost) and `sweep` (the estimate and
+the $40 cap check). Never edit the code instead: a code change after the pilot changes the git sha, and then the
+pilot can no longer stand in for a sweep run.
 
 Running total by step, at $1.79/h, before the measured overhead. The sweep's printed estimate replaces rows B and C
 once `measurements.json` exists.
@@ -191,20 +192,19 @@ uv run --no-sync pytest -m smoke tests/smoke/test_render.py tests/smoke/test_mjl
 
 A failure here is fixed before results (session C), not before training: training never renders.
 
-**Network tests** (never run yet). `tests/conftest.py` removes `WANDB_*`, `HF_*` and `RUNPOD_*` from each test's
-environment, so the W&B and Hub tests need stored logins; `RUNPOD_POD_ID` is only in PID 1's environment:
+**Network tests** (never run yet). Tests marked `network` read the keys from the environment (`tests/conftest.py`
+strips `WANDB_*`, `HF_*` and `RUNPOD_*` only from the other tiers), so export `.env` into the shell. `RUNPOD_POD_ID`
+is only in PID 1's environment, so export it from there:
 
 ```
 set -a; . ./.env; set +a
 export RUNPOD_POD_ID=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^RUNPOD_POD_ID=//p')
-uv run --no-sync wandb login "$WANDB_API_KEY"
-uv run --no-sync hf auth login --token "$HF_TOKEN"
 uv run --no-sync pytest -m network -v --no-cov --deselect tests/network/test_runpod_terminate.py
 ```
 
 `test_wandb_resume.py` is the only test of W&B `resume_from` against the real service (project `mprl-tests`);
 `test_hub_real.py` creates a private `<you>/mprl-smoke-test` repo. If the W&B resume test fails, report it before
-the sweep: resumed runs would fail at `wandb.init`. The fallback is `--wandb-mode offline` on the resumed command.
+the sweep (section 9).
 
 **Throughput test** (about 15 min):
 
@@ -235,7 +235,8 @@ frames / (N × 24).
 | 4096 | 98,304 | 24,576 | | |
 | 16384 | 393,216 | 98,304 | | |
 
-**Pilot** (45 training minutes at 4096 envs, about 0.85 h wall clock; then the pod deletes itself):
+**Pilot** (45 training minutes at 4096 envs, about 0.85 h wall clock; then the pod deletes itself). It first prints
+its cost at the given price; add `--price-per-hour <price>` if the price you read is not $1.79:
 
 ```
 scripts/train.sh pilot
@@ -256,10 +257,10 @@ No threshold for "walks" is defined in the spec or the evaluator, so this is a j
 A suggested bar, to be confirmed with the video: `no_fall_fraction` at least 0.9 and `vel_error_xy` clearly below
 0.5 (for example under 0.25). Evaluate the pilot's final checkpoint on your Mac's CPU (about 30 s; the evaluator
 is the same one `results` uses: 6 fixed commands × 4 envs, seeds 0 and 1, 10 s horizon). The repo is private, so
-log in once with the same write token:
+put the token in the environment first:
 
 ```
-uv run hf auth login
+export HF_TOKEN=<token>
 uv run hf download <HF_REPO_ID> --include "runs/main-long/main-long-n04096-s0/*" --local-dir pilot
 uv run python -c "from pathlib import Path; from mprl.checkpoints import CheckpointStore; from mprl.evaluator import EvalConfig, evaluate_checkpoint; ref = CheckpointStore(Path('pilot/runs/main-long/main-long-n04096-s0')).latest(); print(ref); print(evaluate_checkpoint('pilot', ref, EvalConfig(), 'cpu'))"
 ```
@@ -277,9 +278,19 @@ TensorBoard, so it does not include W&B's cost. If the pilot's figure is higher,
 uv run --no-sync python -c "import dataclasses, sys; from pathlib import Path; from mprl.budget import load_measurements, save_measurements; p = Path(sys.argv[1]); save_measurements(p, dataclasses.replace(load_measurements(p), io_overhead_fraction=float(sys.argv[2]))); print(load_measurements(p))" /workspace/mprl/measurements.json <fraction>
 ```
 
-**No-go:** if the G1 does not walk at 45 minutes, stop. The spec's fallback (move hours from seeds into run length,
-for example 2 seeds × longer runs) needs a code change, because `SweepSpec` defaults in `src/mprl/config.py` have
-no CLI flags. Raise it with the builder before spending more.
+**No-go:** if the G1 does not walk at 45 minutes, use the spec's fallback: move hours from seeds into run length
+with `sweep` options, no code change. For example 2 seeds × 67 minutes costs about what 3 × 45 does
+(5 counts × 2 × 67 = 670 run-minutes against 675):
+
+```
+scripts/train.sh sweep --name main --seeds 0 1 --budget-minutes 67
+```
+
+A budget over 45 minutes means the 45-minute pilot cannot stand in for `main-n04096-s0`, so that run trains too
+(the sweep says why; `--reuse-pilot` is harmless). `--long-run-minutes` changes the long run (at least 45, the
+pilot it resumes). Run ids do not change with the budget, so use a new `--name` (for example `main67`) if a
+45-minute sweep was already started under `main`, and pass the same name to `results`. The estimate and the
+cut confirmation work as below.
 
 ## 6. Session B: the sweep (Paid, about 13 h, running total about $25.52)
 
@@ -290,6 +301,8 @@ cd /workspace/massively-parallel-rl
 scripts/setup.sh
 scripts/train.sh sweep --name main --reuse-pilot
 ```
+
+Add `--price-per-hour <price>` if the A100 price has changed, and the no-go options (section 5) if you chose them.
 
 Re-run `setup.sh` on **every** new pod: the image's `/opt/venv` points its editable `mprl` at the image's copy
 (`/opt/mprl`, no `.git`, no `.env`) until setup re-syncs it to the clone. Press Enter at every prompt to keep `.env`.
@@ -394,6 +407,7 @@ identify it. The results run is `main-results` (job type `results`). Local W&B f
   Until then, self-termination at the end of `pilot` is the first real test: check `runpodctl pod list` after
   the pilot and delete the pod by hand if it is still there.
 - **W&B `resume_from` is untested online** (it is a beta W&B feature). `test_wandb_resume.py` in session A tests it.
+  If it fails, resumed runs fail at `wandb.init`; the fallback is `--wandb-mode offline` on the resumed command.
 - **mujoco_warp out-of-memory class on the A100.** The throughput test records only `torch.OutOfMemoryError` as
   "does not fit"; any other allocation error ends the command. The workaround is in section 4.
 - **EGL rendering on RunPod** is unverified; the render tests in session A check it (results need it, training

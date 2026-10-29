@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from support import APP_ENV_PREFIXES, DEFAULT_MARKEXPR, Subprocesses
+from support import DEFAULT_MARKEXPR, Subprocesses, app_env_to_strip
 
 # One fixed seed for the whole suite. Any value works; it must never change.
 SEED = 20260826
@@ -149,8 +149,11 @@ def _isolated_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Remove app configuration from the environment.
+def _clean_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove app configuration from the environment (``support.app_env_to_strip``).
+
+    A test marked network keeps its service credentials (WANDB_*, HF_*, RUNPOD_*): it calls the real
+    services with the keys from the environment. MPRL_* is removed for every test.
 
     PYTHONHASHSEED is set for child processes only. The running interpreter fixed
     its hash seed at startup; to pin it for this process, set it before launching
@@ -160,9 +163,8 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     drops its ``preexec_fn=os.setpgrp``, so no Python code runs in the child between fork and exec of
     ffmpeg; its own comment cites a hang on fork() (imageio-ffmpeg #58).
     """
-    for key in list(os.environ):
-        if key.startswith(APP_ENV_PREFIXES):
-            monkeypatch.delenv(key, raising=False)
+    for key in app_env_to_strip(list(os.environ), request.node):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("PYTHONHASHSEED", str(SEED))
     monkeypatch.setenv("IMAGEIO_FFMPEG_NO_PREVENT_SIGINT", "1")
 

@@ -17,7 +17,8 @@ import pytest
 
 import mprl.cli as cli
 import mprl.runpod as runpod_mod
-from mprl.budget import CostEstimate, Measurements, save_measurements
+from mprl.budget import PRICE_PER_HOUR, CostEstimate, Measurements, save_measurements
+from mprl.config import SweepSpec
 from mprl.errors import BudgetExceeded, OwnPodUnknown, Terminated, TerminateFailed
 from mprl.results import build_results
 from mprl.run_state import RunState
@@ -517,3 +518,65 @@ def test_swallowed_sigterm_is_still_a_failure_exit(
     terminator.terminate.assert_called_once_with()
     assert "mprl: Terminated: received SIGTERM" in capsys.readouterr().err
     assert sigterm_sentinel == []
+
+
+def test_sweep_options_reach_the_sweep(root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    _measured(root)
+    sweep = _sweep_double(monkeypatch, return_value=[STATE])
+
+    argv = ("--price-per-hour", "2.49", "--seeds", "0", "1", "--budget-minutes", "60", "--long-run-minutes", "90")
+    assert _main("sweep", "--name", "main", *argv) == 0
+
+    assert sweep.call_args.args[0] == SweepSpec("main", seeds=(0, 1), budget_minutes=60.0, long_run_minutes=90.0)
+    assert sweep.call_args.kwargs["price_per_hour"] == pytest.approx(2.49)
+
+
+def test_sweep_options_default_to_the_spec(root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    _measured(root)
+    sweep = _sweep_double(monkeypatch, return_value=[STATE])
+
+    assert _main("sweep", "--name", "main") == 0
+
+    assert sweep.call_args.args[0] == SweepSpec("main")
+    assert sweep.call_args.kwargs["price_per_hour"] == pytest.approx(PRICE_PER_HOUR)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (("sweep", "--name", "main", "--price-per-hour", "0"), "--price-per-hour must be a positive finite number"),
+        (("sweep", "--name", "main", "--seeds"), "--seeds must name at least one seed"),
+        (("sweep", "--name", "main", "--budget-minutes", "1"), "--budget-minutes must be a finite number of at least 3"),
+        (("pilot", "--price-per-hour", "-1"), "--price-per-hour must be a positive finite number"),
+    ],
+)
+def test_bad_option_refuses_before_the_pod_guard(
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+    message: str,
+) -> None:
+    """A typo at the prompt is an operating error: exit 1, nothing trains, and the pod stays up for the retry."""
+    _measured(root)
+    sweep = _sweep_double(monkeypatch, return_value=[STATE])
+    pilot = create_autospec(run_pilot, return_value=STATE)
+    monkeypatch.setattr(cli, "run_pilot", pilot)
+
+    assert _main(*argv) == 1
+
+    assert f"mprl: InvalidInput: {message}" in capsys.readouterr().err
+    sweep.assert_not_called()
+    pilot.assert_not_called()
+    terminator.terminate.assert_not_called()
+
+
+def test_pilot_prints_its_cost_at_the_given_price(
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "run_pilot", create_autospec(run_pilot, return_value=STATE))
+
+    assert _main("pilot", "--price-per-hour", "2.00") == 0
+
+    assert "pilot: 45 training minutes at 4096 envs, $1.50 at $2.00/h before off-clock overhead" in capsys.readouterr().out
