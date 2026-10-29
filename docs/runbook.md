@@ -128,7 +128,7 @@ Settings for every session (console or the command below):
   about $0.004/h).
 - Ports: `22/tcp` (SSH), `8888/http` (Jupyter, optional).
 - Environment variables: **none**. RunPod sets `RUNPOD_POD_ID` itself; the keys come from `.env` on the volume.
-- `--terminate-after` is a backstop against a forgotten pod: A 3 h, B 16 h, C 4 h. If it fires mid-run,
+- `--terminate-after` is a backstop against a forgotten pod: A 3 h, B from the estimate (section 6; about 18 h), C 4 h. If it fires mid-run,
   nothing is lost; resume as in section 8.
 
 ```
@@ -297,15 +297,21 @@ scripts/train.sh sweep --name main --seeds 0 1 --budget-minutes 67
 A budget over 45 minutes means the 45-minute pilot cannot stand in for `main-n04096-s0`, so that run trains too
 (the sweep says why; `--reuse-pilot` is harmless). `--long-run-minutes` changes the long run (at least 45, the
 pilot it resumes). **Keep the name `main`.** The long run is `<name>-long-n04096-s0` and the pilot is
-`main-long-n04096-s0`, so only `--name main` resumes the pilot; any other name trains its long run from zero, 180
-minutes instead of 135 (+0.75 h, +$1.34 at $1.79/h). The budget options need no new name: the gate is decided
+`main-long-n04096-s0`, so only `--name main` resumes the pilot. Any other name costs about +1.5 h, +$2.69 at
+$1.79/h: its long run trains from zero (180 minutes instead of 135, +0.75 h), and the pilot can no longer stand in
+for its `n04096-s0` run, which trains too (+0.75 h). The budget options need no new name: the gate is decided
 before any sweep run exists, and if a `main` run had already finished at 45 minutes, a larger `--budget-minutes`
 continues it on the same clock and W&B run (the config hash leaves the budget out). The estimate and the cut
 confirmation work as below.
 
 ## 6. Session B: the sweep (Paid, about 13 h, running total about $25.52)
 
-Create a new pod (section 3, `--terminate-after` 16 h), SSH in, start `tmux`, then:
+Size the pod's `--terminate-after` (section 3) from the estimate, not a fixed 16 h: session B trains the sweep
+runs and the rest of the long run, so take the estimate's sweep-runs and long-run lines and add about 3 h (pod
+start, setup, env builds, slack). From `io_overhead_fraction` in `measurements.json` (session A prints it), the
+default sweep is `(15 × 0.75 + 3) × (1 + io) + 3` hours: 17.96 h at io = 0.05, 18.68 h at io = 0.1. This counts
+`main-n04096-s0` and the long run's first 45 minutes, which the pilot already trained, so it errs long, which is the
+safe side for a backstop. Then SSH in, start `tmux`, and:
 
 ```
 cd /workspace/massively-parallel-rl
@@ -322,9 +328,14 @@ The sweep first prints the estimate: one line each for setup (4.25 h), the sweep
 long run as `180 of 180 min left` × (1 + io), and the evaluations × measured seconds, then the total hours and
 dollars. It is conservative on purpose. It costs the whole project against the $40 cap, so setup (session A,
 already spent) is included. It costs the long run in full, although the pilot already trained its first 45
-minutes. It also costs `main-n04096-s0` even when the pilot stands in for it. At $1.79/h and io = 0 the last two
-add 2 × 0.75 h = 1.5 h, about $2.69, over the spend in section 1's rows B and C. A plan it accepts therefore fits
-the cap with that margin.
+minutes. It also costs `main-n04096-s0` even when the pilot stands in for it. At $1.79/h and io = 0 those two
+add 2 × 0.75 h = 1.5 h, about $2.69, over the spend in section 1's rows B and C. Two more terms are fixed rather
+than measured. Setup is always 4.25 h (the spec's throughput test plus debugging, smoke tests, evaluation and
+rendering), against about 1.4 h that session A's rows spend; the rest is the reserve. Evaluations are counted at
+285 (15 runs × 15 marks = 225, plus the long run's 60 marks), while `results` evaluates the 225 and spends the
+long run's 60 marks on rendering its videos (section 7): a play-env build and a 4 s rollout each, about one
+evaluation's time, so that term roughly holds. A plan it accepts therefore fits the cap with at least the 1.5 h
+margin.
 
 With no cut needed it starts training at once. With cuts it lists them and asks `Train with these cuts? [y/N]`;
 `N` keeps the pod running and trains nothing. `--yes` accepts the cuts without asking (they are still printed);
@@ -332,7 +343,7 @@ without a terminal and without `--yes`, it refuses. Over $40 after every cut, it
 
 `--reuse-pilot` lets the pilot stand in for `main-n04096-s0` when HEAD equals the pilot's git sha, the configs
 match, and the pilot is complete at 45 minutes; otherwise it prints why not and trains that run too (+0.75 h,
-+$1.34). Then every run trains count-major (64 first), then
++$1.34). Then every run trains count-major (64 first; GPU memory is released after each run), then
 the long run resumes the pilot to 180 minutes (90 with `long_run_half`). Completed runs are skipped; each run
 uploads its final checkpoint to Hugging Face when it ends. When everything is done or anything fails, the pod
 deletes itself after the uploads have finished or been recorded as failed.
@@ -356,9 +367,14 @@ scripts/train.sh results --name main --primary-metric vel_error_xy --terminate
 
 It evaluates every sweep run at every evaluation mark (each mark takes the checkpoint that crossed it), writes
 `results.csv`, `learning_curves.png`, `race.mp4` (median seed per count, 1.0 m/s straight ahead, one panel per
-count) and `README.md` (the model card), logs them to the W&B run `main-results`, uploads them to
-`results/main` on Hugging Face, then deletes the pod. Evaluations are cached per checkpoint, so a re-run evaluates
-only what is new.
+count) and `README.md` (the model card), and renders the **long-run videos**: `main-long-n04096-s0` at each of its
+evaluation marks (60 at 3-min marks up to 180 min; 30 with `long_run_half`), the checkpoint that crossed the mark,
+4 s at 1.0 m/s straight ahead, into `sweeps/main-long/main-long-n04096-s0/videos/t<minutes>min_it<iteration>.mp4`.
+It logs everything to the W&B run `main-results` (the videos as `results/long_run_video` against
+`results/long_run_train_minutes`), uploads the results to `results/main` and the videos to
+`results/main/long_run_videos` on Hugging Face, then deletes the pod. Evaluations and videos are cached per
+checkpoint, so a re-run evaluates and renders only what is new. Training is not touched: the videos come from
+checkpoints already on the volume.
 
 **Primary metric: `vel_error_xy`.** It is the one number that separates walking from standing: a robot that stands
 still scores 0.5 m/s on it but can score 1.0 on `no_fall_fraction`. `mean_time_to_fall_s` saturates at the 10 s
@@ -390,6 +406,7 @@ resume (`ConfigMismatch`) and names the cause. Do not `git pull` mid-project; th
 | `sweeps/<sweep>/<run_id>/state.json` | status (`running`, `complete`, `failed`), W&B id, config hash, training seconds, budget, git sha, upload outcomes |
 | `sweeps/<sweep>/<run_id>/params/` | resolved env and agent configs |
 | `sweeps/<sweep>/<run_id>/eval/eval.csv` | cached evaluations |
+| `sweeps/<sweep>-long/<run_id>/videos/` | the long run's videos, one per evaluation mark (written by `results`) |
 | `sweeps/<sweep>/results/` | `sweep_manifest.json`, `pilot_reuse.json`, `results.csv`, `learning_curves.png`, `race.mp4`, `README.md` |
 | `sweeps/<sweep>/results_publish.json` | outcome of the W&B and Hub publish |
 
@@ -404,8 +421,14 @@ python -m json.tool /workspace/mprl/sweeps/main/results/sweep_manifest.json
 ```
 
 **W&B:** project `WANDB_PROJECT` (default `mprl-humanoid-walk`). Each training run has id `<run_id>-<8 hex>` and
-job type `train`, grouped by sweep (`main`, `main-long`); `config.run_id`, `config.batch` and `config.git_sha`
-identify it. The results run is `main-results` (job type `results`). Local W&B files are under
+job type `train`, grouped by sweep (`main`, `main-long`) and tagged `n<5-digit num_envs>` and `seed<seed>`, so all
+counts compare in one group and a tag (or `config.run.num_envs`) splits them; `config.run_id`, `config.batch` and
+`config.git_sha` identify it. `Train/mean_reward` and `Train/mean_episode_length` are charted against
+`Perf/train_clock_minutes` (the training clock, logged every iteration); every other chart uses the iteration and
+can be switched to that x-axis. rsl_rl's `Train/*/time` wall-time series is not sent to W&B (it would make W&B drop
+every later metric). If `wandb.init` fails online (network, auth, timeout), that run logs offline instead, says so
+in a warning and in its `state.json` (`uploads.wandb`), and the sweep goes on; upload it later with
+`wandb sync /workspace/massively-parallel-rl/wandb/offline-run-*<run id>*`. The results run is `main-results` (job type `results`). Local W&B files are under
 `/workspace/massively-parallel-rl/wandb/`.
 
 **Hugging Face** (`HF_REPO_ID`, private): `runs/<sweep>/<run_id>/` holds the final checkpoint, `checkpoints.onnx`,

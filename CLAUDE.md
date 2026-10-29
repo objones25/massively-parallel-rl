@@ -230,7 +230,7 @@ PPO config. Spec: `docs/superpowers/specs/2026-10-27-parallel-humanoid-walking-d
 | `checkpoints.py` | `CheckpointStore`: atomic minute-stamped files, `latest`, `crossed(mark)` |
 | `timed_runner.py` | `TimedOnPolicyRunner.learn_for`: rsl_rl 5.4.2's `learn` on the clock, time-based checkpoints |
 | `diagnostics.py` | `Diag/*`: gradient, weight, update-ratio, activation, KL / clip fraction / explained variance |
-| `wandb_writer.py` | `ResumableWandbWriter` (rsl_rl `LogWriter`; fixed id, `resume_from` on resume) |
+| `wandb_writer.py` | `ResumableWandbWriter` (rsl_rl `LogWriter`; fixed id, `resume_from` on resume; drops `*/time`; offline fallback) |
 | `train.py` | `train_run`: skip / resume / train / state / upload for one run; `built_runner`; `git_sha` |
 | `run_state.py` | `state.json` (atomic): status, W&B id, config hash, clock, git sha, upload outcomes |
 | `hub.py` | `HubPublisher`: Hugging Face repo + folder upload with bounded retry |
@@ -251,8 +251,24 @@ PPO config. Spec: `docs/superpowers/specs/2026-10-27-parallel-humanoid-walking-d
 `TrainingClock`; checkpoints go to the `CheckpointStore`, metrics through rsl_rl's logger to the
 `ResumableWandbWriter`, `Diag/*` from `diagnostics` hooks off the clock. After the final checkpoint `publish`
 exports ONNX and `HubPublisher` uploads the run; `PodGuard` / `PodTerminator` delete the pod when the command
-ends, however it ends. `mprl results` runs the evaluator on the checkpoints at each mark, then `curves`,
-`race_video` and `results_card` build the CSV, chart, video and card, published to W&B and the Hub.
+ends, however it ends; `release_device_memory` (gc + `empty_cache`) runs after every sweep / pilot run, since a
+finished runner/env is a gc-only cycle holding GPU memory. `mprl results` runs the evaluator on the checkpoints at
+each mark, then `curves`, `race_video` and `results_card` build the CSV, chart, race video and card, renders the
+long-run videos (`render_long_run_videos`), and publishes to W&B and the Hub.
+
+**W&B.** One run per training run, group = sweep, tags `n<5-digit num_envs>` and `seed<seed>`, job type `train`.
+`ResumableWandbWriter.add_scalar` drops tags ending in `/time`: rsl-rl-lib 5.4.2 writes `Train/*/time` at
+`step=int(tot_time)` for any non-W&B writer, and W&B silently drops steps lower than the current one, which would
+discard every later per-iteration metric. `train._learn` logs `Perf/train_clock_minutes` (the training clock) every
+iteration, off the clock; it is `define_metric`-ed and the default x-axis of `Train/*`. An online `wandb.init`
+failing with `CommError` (incl. `AuthenticationError`) or `TimeoutError` retries offline with the same id and is
+recorded in `state.json` `uploads["wandb"]`; `UsageError` is not caught.
+
+**Videos.** Training renders nothing. `mprl results` renders, per long-run (`<sweep>-long`) evaluation mark, the
+checkpoint that crossed it (`render_rollout`, `EVAL_COMMANDS[1]`, `render_seconds`, default 4 s) to
+`RunPaths(long_run).videos_dir/t<mark>min_it<iteration>.mp4` (cached; stale ones removed), logs them to the W&B
+results run as `results/long_run_video` against `results/long_run_train_minutes`, and uploads them to
+`results/<sweep>/long_run_videos` on the Hub; plus `race.mp4` in the results dir.
 
 **Fairness invariants** (spec §4, §9):
 
