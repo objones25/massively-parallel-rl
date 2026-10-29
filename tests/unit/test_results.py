@@ -319,9 +319,7 @@ def test_publish_hub_uploads_the_long_run_videos(tmp_path: Path):
 
 
 def test_wandb_results_run_logs_each_long_run_video(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    for name in ("learning_curves.png", "race.mp4", "a.mp4", "b.mp4"):
-        (tmp_path / name).write_bytes(b"x")
-    run = create_autospec(wandb.Run, instance=True)
+    run = create_autospec(wandb.Run, instance=True)  # Image and Video are doubles too: no media files needed
     monkeypatch.setattr(wandb, "init", create_autospec(wandb.init, return_value=run))
     monkeypatch.setattr(wandb, "Image", create_autospec(wandb.Image))
     monkeypatch.setattr(wandb, "Video", create_autospec(wandb.Video))
