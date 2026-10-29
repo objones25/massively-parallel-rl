@@ -8,19 +8,23 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
-from unittest.mock import create_autospec
+from unittest.mock import MagicMock, create_autospec
 
+import numpy as np
 import pytest
+import wandb
 
 import mprl.results as results_mod
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.config import SweepSpec
 from mprl.curves import CurvePoint
 from mprl.errors import UploadFailed
-from mprl.evaluator import EvalConfig, EvalResult, evaluate_checkpoint
+from mprl.evaluator import EVAL_COMMANDS, EvalConfig, EvalResult, evaluate_checkpoint
 from mprl.hub import HubPublisher
 from mprl.negative_space import CheckFailed
 from mprl.paths import RunPaths, sweep_results_dir
+from mprl.race_video import write_video
+from mprl.render import render_rollout
 from mprl.results import (
     RunSource,
     build_results,
@@ -29,6 +33,7 @@ from mprl.results import (
     marked_checkpoints,
     planned_sweep,
     publish_hub,
+    render_long_run_videos,
     run_sources,
 )
 from mprl.results_card import model_card
@@ -226,3 +231,124 @@ def test_publish_hub_failure_is_recorded_and_keeps_local_results(tmp_path: Path)
 
 def test_publish_hub_without_publisher_is_skipped(tmp_path: Path):
     assert publish_hub(SWEEP, tmp_path, None) == "skipped: no publisher"
+
+
+# --- long-run videos (off the clock, during results) ---------------------------------------------------
+
+LONG = replace(SWEEP, long_run_minutes=9.0)  # long-run evaluation marks 3, 6, 9
+
+
+def _frames(*_args: object, **_kwargs: object) -> np.ndarray:
+    return np.zeros((2, 4, 6, 3), dtype=np.uint8)
+
+
+def _write(frames: object, path: Path, fps: int) -> None:
+    path.write_bytes(b"mp4")
+
+
+@pytest.fixture
+def renderer(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """``render_rollout`` and ``write_video`` as autospec doubles; the render double is returned."""
+    render = create_autospec(render_rollout, side_effect=_frames)
+    monkeypatch.setattr(results_mod, "render_rollout", render)
+    monkeypatch.setattr(results_mod, "write_video", create_autospec(write_video, side_effect=_write))
+    return render
+
+
+def _long_videos(root: Path) -> list[tuple[float, Path]]:
+    return render_long_run_videos(LONG, root, seconds=4.0, size=(4, 6), device="cpu")
+
+
+def test_long_run_video_per_evaluation_mark_from_its_checkpoint(tmp_path: Path, renderer: MagicMock):
+    long_paths = RunPaths(tmp_path, LONG.long_run())
+    _fill(CheckpointStore(long_paths.checkpoints_dir), [3.0, 6.0, 9.0])
+
+    videos = _long_videos(tmp_path)
+
+    assert [(mark, p.name) for mark, p in videos] == [
+        (3.0, "t0003.000min_it0000010.mp4"),
+        (6.0, "t0006.000min_it0000020.mp4"),
+        (9.0, "t0009.000min_it0000030.mp4"),
+    ]
+    assert {p.parent for _, p in videos} == {long_paths.videos_dir}
+    assert [c.args[0].iteration for c in renderer.call_args_list] == [10, 20, 30]
+    assert {(c.args[1], c.args[2]) for c in renderer.call_args_list} == {(EVAL_COMMANDS[1], 4.0)}
+
+
+def test_long_run_videos_are_cached(tmp_path: Path, renderer: MagicMock):
+    _fill(CheckpointStore(RunPaths(tmp_path, LONG.long_run()).checkpoints_dir), [3.0, 6.0, 9.0])
+    first = _long_videos(tmp_path)
+    renderer.reset_mock()
+
+    again = _long_videos(tmp_path)
+
+    renderer.assert_not_called()
+    assert again == first
+
+
+def test_long_run_mark_without_a_checkpoint_has_no_video_and_stale_videos_go(tmp_path: Path, renderer: MagicMock):
+    long_paths = RunPaths(tmp_path, LONG.long_run())
+    _fill(CheckpointStore(long_paths.checkpoints_dir), [3.0])  # the long run stopped after 3 min
+    long_paths.videos_dir.mkdir(parents=True)
+    (long_paths.videos_dir / "t0003.000min_it0000099.mp4").write_bytes(b"old")  # from an earlier checkpoint set
+
+    videos = _long_videos(tmp_path)
+
+    assert [p.name for _, p in videos] == ["t0003.000min_it0000010.mp4"]
+    assert sorted(p.name for p in long_paths.videos_dir.iterdir()) == ["t0003.000min_it0000010.mp4"]
+
+
+def test_long_run_without_checkpoints_renders_nothing(tmp_path: Path, renderer: MagicMock):
+    assert _long_videos(tmp_path) == []
+
+    renderer.assert_not_called()
+
+
+def test_publish_hub_uploads_the_long_run_videos(tmp_path: Path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "t0003.000min_it0000010.mp4").write_bytes(b"mp4")
+    publisher = create_autospec(HubPublisher, instance=True)
+
+    assert publish_hub(SWEEP, tmp_path, publisher, long_run_videos=videos) == "ok"
+
+    assert [c.args for c in publisher.upload_folder.call_args_list] == [
+        (tmp_path, "results/main", "main: results"),
+        (videos, "results/main/long_run_videos", "main: long-run videos"),
+    ]
+
+
+def test_wandb_results_run_logs_each_long_run_video(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    for name in ("learning_curves.png", "race.mp4", "a.mp4", "b.mp4"):
+        (tmp_path / name).write_bytes(b"x")
+    run = create_autospec(wandb.Run, instance=True)
+    monkeypatch.setattr(wandb, "init", create_autospec(wandb.init, return_value=run))
+    monkeypatch.setattr(wandb, "Image", create_autospec(wandb.Image))
+    monkeypatch.setattr(wandb, "Video", create_autospec(wandb.Video))
+    videos = [(3.0, tmp_path / "a.mp4"), (6.0, tmp_path / "b.mp4")]
+
+    outcome = results_mod._publish_wandb(SWEEP, tmp_path, "disabled", {}, videos)
+
+    assert outcome == "ok"
+    long_logs = [c.args[0] for c in run.log.call_args_list if "results/long_run_video" in c.args[0]]
+    assert [entry["results/long_run_train_minutes"] for entry in long_logs] == [3.0, 6.0]
+    assert [c.args[0] for c in wandb.Video.call_args_list][-2:] == [str(p) for _, p in videos]  # type: ignore[attr-defined]
+    run.define_metric.assert_any_call("results/long_run_video", step_metric="results/long_run_train_minutes")
+
+
+def test_model_card_names_the_long_run_videos_and_the_small_n_overhead_bias():
+    card = model_card(
+        SWEEP,
+        {},
+        reuse={},
+        eval_cfg=EvalConfig(),
+        primary_metric="vel_error_xy",
+        final_points=[],
+        race=((1.0, 0.0, 0.0), 4.0, 45.0, {}),
+        long_run_video_marks=(3.0, 6.0),
+    )
+
+    assert "`long_run_videos/`" in card
+    assert "main-long-n04096-s0" in card
+    assert "2 evaluation marks" in card
+    assert "weigh proportionally more on small-N runs" in card

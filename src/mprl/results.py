@@ -6,6 +6,13 @@ after any cut); without a manifest, the requested ``sweep``. A run the pilot sto
 (``pilot_reuse.json``) reads the pilot's checkpoints, up to the one that crossed ``max_minutes``, and its
 evaluations are cached in the pilot's own ``eval/eval.csv`` (they belong to its checkpoints).
 
+The long run (``<sweep>-long``) gets a rollout video at each of its evaluation marks (every
+``eval_every_minutes`` up to ``long_run_minutes``): ``render_rollout`` of the checkpoint that crossed the mark on
+``RACE_COMMAND`` (``EVAL_COMMANDS[1]``), written to the long run's ``videos/`` as
+``t<mark minutes>min_it<iteration>.mp4``, cached by file name (a re-run renders only what is new and removes
+videos of checkpoints no longer marked), logged to the W&B results run and uploaded to
+``results/<sweep>/long_run_videos`` on the Hub. Training is untouched: this runs during ``results`` only.
+
 Evaluation marks are every ``eval_every_minutes`` plus always the budget; race-video marks every
 ``checkpoint_every_minutes`` plus the budget. A mark takes the checkpoint that crossed it
 (``CheckpointStore.crossed`` with the checkpoint interval); a mark with none is absent. Results stay
@@ -240,6 +247,46 @@ def _render_race(
     os.replace(tmp, out)
 
 
+def _long_run_video_name(mark: float, ref: CheckpointRef) -> str:
+    return f"t{mark:08.3f}min_it{ref.iteration:07d}.mp4"
+
+
+def render_long_run_videos(
+    sweep: SweepSpec, root: Path, *, seconds: float, size: tuple[int, int], device: str
+) -> list[tuple[float, Path]]:
+    """``(mark, mp4)`` per long-run evaluation mark that a checkpoint crossed, rendering only the missing ones."""
+    require(seconds > 0.0, f"seconds must be positive, got {seconds}")
+    require(size[0] % 2 == 0 and size[1] % 2 == 0, f"render size must be even, got {size}")
+    paths = RunPaths(root, sweep.long_run())
+    marks = eval_marks(sweep.eval_every_minutes, sweep.long_run_minutes)
+    marked = marked_checkpoints(
+        CheckpointStore(paths.checkpoints_dir),
+        marks,
+        interval_minutes=sweep.checkpoint_every_minutes,
+        max_minutes=sweep.long_run_minutes,
+    )
+    videos: list[tuple[float, Path]] = []
+    for mark, ref in bounded(marked.items(), len(marked), "long-run marks"):
+        if ref is None:
+            continue
+        path = paths.videos_dir / _long_run_video_name(mark, ref)
+        if not path.is_file():
+            log.info("rendering %s at %g min (iteration %d)", paths.spec.run_id, mark, ref.iteration)
+            frames = render_rollout(ref, RACE_COMMAND, seconds, height=size[0], width=size[1], device=device)
+            tmp = path.with_name(f".{path.stem}.tmp{path.suffix}")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            write_video(iter(frames), tmp, RACE_FPS)
+            os.replace(tmp, path)
+        videos.append((mark, path))
+    keep = {path.name for _, path in videos}
+    if paths.videos_dir.is_dir():
+        for stale in paths.videos_dir.glob("t*min_it*.mp4"):
+            if stale.name not in keep:
+                stale.unlink()  # a checkpoint no longer marked (e.g. the run was resumed): not to be uploaded
+    require(len(videos) <= len(marks), f"{len(videos)} videos for {len(marks)} marks")
+    return videos
+
+
 def _check_shipped_batch_config() -> None:
     """The chart caption and model card use ``batch_arithmetic``'s defaults; they must be the shipped config."""
     rl = load_task_rl_cfg(TASK_ID)
@@ -247,8 +294,15 @@ def _check_shipped_batch_config() -> None:
     require(shipped == batch_arithmetic(1), f"shipped batch config {shipped} differs from the defaults")
 
 
-def _publish_wandb(sweep: SweepSpec, out: Path, mode: str, config: Mapping[str, Any]) -> str:
-    """Log the chart and the race video to the sweep group's ``results`` run; "ok" or the error text."""
+def _publish_wandb(
+    sweep: SweepSpec,
+    out: Path,
+    mode: str,
+    config: Mapping[str, Any],
+    long_run_videos: Sequence[tuple[float, Path]] = (),
+) -> str:
+    """Log the chart, the race video and the long-run videos (x-axis: training minutes) to the sweep group's
+    ``results`` run; "ok" or the error text."""
     try:
         run = wandb.init(
             project=os.environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT),
@@ -267,6 +321,15 @@ def _publish_wandb(sweep: SweepSpec, out: Path, mode: str, config: Mapping[str, 
                 "results/race": wandb.Video(str(out / "race.mp4"), format="mp4"),
             }
         )
+        run.define_metric("results/long_run_train_minutes")
+        run.define_metric("results/long_run_video", step_metric="results/long_run_train_minutes")
+        for mark, video in long_run_videos:
+            run.log(
+                {
+                    "results/long_run_video": wandb.Video(str(video), format="mp4"),
+                    "results/long_run_train_minutes": mark,
+                }
+            )
     except (WandbError, OSError) as error:
         log.error("W&B results run for %s failed: %s", sweep.name, error)
         return f"{type(error).__name__}: {error}"
@@ -275,12 +338,19 @@ def _publish_wandb(sweep: SweepSpec, out: Path, mode: str, config: Mapping[str, 
     return "ok"
 
 
-def publish_hub(sweep: SweepSpec, out: Path, publisher: HubPublisher | None) -> str:
+def publish_hub(
+    sweep: SweepSpec, out: Path, publisher: HubPublisher | None, *, long_run_videos: Path | None = None
+) -> str:
+    """Upload the results dir, then the long-run videos dir when it holds any; "ok" or the error text."""
     if publisher is None:
         return "skipped: no publisher"
     try:
         publisher.ensure_repo()
         publisher.upload_folder(out, f"results/{sweep.name}", f"{sweep.name}: results")
+        if long_run_videos is not None and any(long_run_videos.glob("*.mp4")):
+            publisher.upload_folder(
+                long_run_videos, f"results/{sweep.name}/long_run_videos", f"{sweep.name}: long-run videos"
+            )
     except (UploadFailed, HfHubHTTPError, OSError) as error:
         log.error("upload of %s results failed: %s", sweep.name, error)
         return f"{type(error).__name__}: {error}"
@@ -299,7 +369,8 @@ def build_results(
     render_seconds: float = RACE_SECONDS_PER_MARK,
     render_size: tuple[int, int] = (360, 480),
 ) -> Path:
-    """Evaluate, write ``results.csv``, the chart, ``race.mp4`` and ``README.md``, then publish; the results dir."""
+    """Evaluate, write ``results.csv``, the chart, ``race.mp4``, the long-run videos and ``README.md``, then
+    publish; the results dir."""
     validate_metric(primary_metric)
     cfg = eval_cfg or EvalConfig()
     _check_shipped_batch_config()
@@ -318,6 +389,7 @@ def build_results(
     last = max(p.minutes for p in points)  # the budget, unless every run stopped before it
     median = median_seed_run(evals, primary_metric, run_envs, at_minutes=last)
     _render_race(sources, median, planned, out / "race.mp4", seconds=render_seconds, size=render_size, device=device)
+    long_videos = render_long_run_videos(planned, root, seconds=render_seconds, size=render_size, device=device)
 
     reuse = _read_json(out / "pilot_reuse.json")
     card = model_card(
@@ -328,11 +400,16 @@ def build_results(
         primary_metric=primary_metric,
         final_points=[p for p in points if p.minutes == last],
         race=(RACE_COMMAND, render_seconds, last, median),
+        long_run_video_marks=[mark for mark, _ in long_videos],
     )
     (out / "README.md").write_text(card)
 
     config = {"sweep": planned.name, "primary_metric": primary_metric, "median_runs": median, "median_at": last}
-    status = {"wandb": _publish_wandb(planned, out, wandb_mode, config), "hub": publish_hub(planned, out, publisher)}
+    videos_dir = RunPaths(root, planned.long_run()).videos_dir
+    status = {
+        "wandb": _publish_wandb(planned, out, wandb_mode, config, long_videos),
+        "hub": publish_hub(planned, out, publisher, long_run_videos=videos_dir),
+    }
     (out.parent / "results_publish.json").write_text(json.dumps(status, indent=2) + "\n")
     for target, outcome in status.items():
         if outcome != "ok":

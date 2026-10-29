@@ -28,7 +28,13 @@ from mprl.run_state import RunState, save_state
 pytestmark = [pytest.mark.smoke, pytest.mark.usefixtures("offline_wandb")]
 
 SWEEP = SweepSpec(
-    "smoke", env_counts=(4, 8), seeds=(0, 1), budget_minutes=0.1, checkpoint_every_minutes=0.05, eval_every_minutes=0.05
+    "smoke",
+    env_counts=(4, 8),
+    seeds=(0, 1),
+    budget_minutes=0.1,
+    checkpoint_every_minutes=0.05,
+    eval_every_minutes=0.05,
+    long_run_minutes=0.1,  # the long run's two marks get a video each
 )
 EVAL = EvalConfig(seeds=(0,), envs_per_command=1, horizon_s=0.2)
 SMALL: dict[str, Any] = {"eval_cfg": EVAL, "render_seconds": 0.1, "render_size": (64, 96)}
@@ -38,8 +44,8 @@ CHECKPOINTS = ((1, 3.0), (3, 6.0))  # (iteration, training-clock s): one crossin
 
 
 def _lay_out_sweep(root: Path, weights: CheckpointRef) -> None:
-    """Every run of SWEEP as a completed run whose checkpoints hold ``weights``' real parameters."""
-    for spec in SWEEP.runs():
+    """Every run of SWEEP and its long run as completed runs whose checkpoints hold ``weights``' real parameters."""
+    for spec in [*SWEEP.runs(), SWEEP.long_run()]:
         paths = RunPaths(root, spec)
         store = CheckpointStore(paths.checkpoints_dir)
         for iteration, seconds in CHECKPOINTS:
@@ -73,6 +79,9 @@ def test_build_results_end_to_end_cpu(tmp_path: Path, monkeypatch: pytest.Monkey
     }
     assert rows == every_mark  # every run has its crossing checkpoint at every mark, the budget mark included
     assert "vel_error_xy" in (out / "README.md").read_text()
+    videos = sorted(p.name for p in RunPaths(root, SWEEP.long_run()).videos_dir.iterdir())
+    assert videos == ["t0000.050min_it0000001.mp4", "t0000.100min_it0000003.mp4"]
+    assert "`long_run_videos/`: the long run `smoke-long-n04096-s0`" in (out / "README.md").read_text()
     status = json.loads((out.parent / "results_publish.json").read_text())
     assert status == {"wandb": "ok", "hub": "skipped: no publisher"}
     first_eval = {spec.run_id: read_eval_csv(RunPaths(root, spec).eval_dir / "eval.csv") for spec in SWEEP.runs()}

@@ -34,7 +34,12 @@ at steps 0 (lin_vel_x +-1.0, ang_vel_z +-0.5), 5000*24 (lin_vel_x -1.5..2.0, ang
 10000*24 (lin_vel_x -2.0..3.0). Small-N runs complete more iterations per training minute and so reach
 the harder stages sooner. That favors them, so the measured speed-up of large N is, if anything,
 understated. Every evaluation command lies inside stage 0, so no run is scored on commands it was
-never trained on."""
+never trained on.
+
+Fixed on-clock costs per env step or per iteration (rsl_rl's per-step `.cpu()` episode bookkeeping and
+`check_nan` syncs, and the gradient-norm hooks armed every 10th iteration) are the same for every run, so they
+weigh proportionally more on small-N runs, whose steps each do less work. This biases against small N: on
+its own it makes the measured speed-up of large N larger than the simulator and PPO alone would give."""
 
 
 def _cuts_section(manifest: Mapping[str, Any]) -> list[str]:
@@ -49,6 +54,21 @@ def _cuts_section(manifest: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _long_run_lines(
+    sweep: SweepSpec, marks: Sequence[float], command: tuple[float, float, float], seconds: float
+) -> list[str]:
+    run_id = sweep.long_run().run_id
+    if not marks:
+        return [f"`long_run_videos/`: none; the long run `{run_id}` has no checkpoint at any evaluation mark.", ""]
+    return [
+        f"`long_run_videos/`: the long run `{run_id}` ({sweep.long_run_envs} envs, {sweep.long_run_minutes:g} "
+        f"training minutes) at {len(marks)} evaluation marks ({marks[0]:g} to {marks[-1]:g} min), each the "
+        f"checkpoint that crossed the mark rendered for {seconds:g} s in real time on command {command}; "
+        "named `t<minutes>min_it<iteration>.mp4`.",
+        "",
+    ]
+
+
 def model_card(
     sweep: SweepSpec,
     manifest: Mapping[str, Any],
@@ -58,6 +78,7 @@ def model_card(
     primary_metric: str,
     final_points: Sequence[CurvePoint],
     race: tuple[tuple[float, float, float], float, float, Mapping[int, str]],
+    long_run_video_marks: Sequence[float] = (),
 ) -> str:
     command, race_seconds, median_at, median = race
     batch_rows = []
@@ -134,5 +155,6 @@ def model_card(
         "",
         "`results.csv`: one row per run and evaluation mark (absent marks have no row).",
         "",
+        *_long_run_lines(sweep, long_run_video_marks, command, race_seconds),
     ]
     return "\n".join(lines)
