@@ -269,9 +269,12 @@ def test_only_num_envs_and_seed_differ_between_sweep_runs() -> None:
         "agent.logger.extra_config.batch.num_envs",
         "agent.logger.extra_config.batch.batch_size",
         "agent.logger.extra_config.batch.minibatch_size",
+        "agent.logger.tags[0]",  # "n<num_envs>": the W&B group stays the sweep
+        "agent.logger.tags[1]",  # "seed<seed>"
     }
     assert _diff(a, b) == {"env.scene.num_envs", "env.seed", "agent.seed", "agent.logger.run_id"} | derived
     assert json.dumps(a["agent"]["logger"]["extra_config"])  # serializable for wandb.config
+    assert (a["agent"]["logger"]["group"], a["agent"]["logger"]["tags"]) == ("main", ["n00064", "seed0"])
 
 
 SECRETS = {

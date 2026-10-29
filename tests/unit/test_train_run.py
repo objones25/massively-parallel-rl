@@ -11,12 +11,15 @@ import os
 import signal
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
+import wandb
 from huggingface_hub import HfApi
 from support import runpod_terminator
+from wandb.errors import CommError
 
 import mprl.publish as publish_mod
 import mprl.train as train_mod
@@ -30,6 +33,7 @@ from mprl.paths import RunPaths
 from mprl.publish import PodGuard, finish_and_terminate, sigterm_raises
 from mprl.run_state import RunState, Status, load_state, save_state
 from mprl.train import TrainDeps, failed_after_final_checkpoint, train_run, wandb_run_id_for
+from mprl.wandb_writer import CLOCK_METRIC, ResumableWandbWriter
 
 EVERY_MIN = 1.0 / 60.0
 SPEC = RunSpec("main", 4, 0, 2.0 / 60.0, EVERY_MIN)
@@ -433,3 +437,94 @@ def test_run_files_and_upload_never_contain_secrets(
     on_disk = [p.read_text(errors="replace") for p in tmp_path.rglob("*") if p.is_file()]
     assert len(staged) == len(UPLOADED) + 1  # control: the upload ran
     assert [name for name, value in SECRETS.items() if value in "\n".join(on_disk + staged)] == []
+
+
+# --- per-iteration W&B: training clock and the offline fallback ---------------------------------------
+
+
+class _Logger:
+    def __init__(self, writer: ResumableWandbWriter) -> None:
+        self.writer = writer
+
+
+class _RunnerOnTheClock:
+    """Duck-types what ``train._learn`` uses: two iterations, 15 s on the clock each, then the final checkpoint."""
+
+    current_learning_iteration = 1
+
+    def __init__(self, writer: ResumableWandbWriter) -> None:
+        self.logger = _Logger(writer)
+
+    def learn_for(
+        self,
+        clock: TrainingClock,
+        *_args: object,
+        on_iteration: Callable[[int], None],
+        on_checkpoint: Callable[[CheckpointRef], None],
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        for it in range(2):
+            with clock.measure():
+                pass
+            on_iteration(it)
+        final = _ref(1, clock.elapsed_s)
+        on_checkpoint(final)
+        return SimpleNamespace(final=final)
+
+
+def _fake_now(step_s: float) -> Callable[[], float]:
+    """A time source that advances ``step_s`` per read: each ``measure()`` (a start and an end read) adds ``step_s``."""
+    ticks = iter(range(1_000))
+    return lambda: next(ticks) * step_s
+
+
+def _learn_with(writer: ResumableWandbWriter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    monkeypatch.setattr(
+        train_mod.diagnostics, "for_runner", lambda *_args: (_StubDiagnostics(), lambda _it: None, lambda _it: None)
+    )
+    _, _, errors = train_mod._learn(  # type: ignore[arg-type]  duck-typed runner
+        SPEC,
+        RunPaths(tmp_path, SPEC),
+        DEPS,
+        _RunnerOnTheClock(writer),
+        TrainingClock(now=_fake_now(15.0)),
+        3600.0,
+        fresh_start=True,
+    )
+    return errors
+
+
+def test_training_clock_is_logged_every_iteration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run = create_autospec(wandb.Run, instance=True)
+    monkeypatch.setattr(wandb, "init", create_autospec(wandb.init, return_value=run))
+    writer = ResumableWandbWriter("logs", "p", "rid", "grp", mode="disabled")
+
+    errors = _learn_with(writer, tmp_path, monkeypatch)
+
+    logged = [(c.args[0], c.kwargs["step"]) for c in run.log.call_args_list]
+    assert logged == [({CLOCK_METRIC: pytest.approx(0.25)}, 0), ({CLOCK_METRIC: pytest.approx(0.5)}, 1)]
+    assert errors == {}
+
+
+def test_wandb_offline_fallback_is_recorded_for_the_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run = create_autospec(wandb.Run, instance=True)
+    monkeypatch.setattr(wandb, "init", create_autospec(wandb.init, side_effect=[CommError("503"), run]))
+    writer = ResumableWandbWriter("logs", "p", "rid", "grp", mode="online")
+
+    errors = _learn_with(writer, tmp_path, monkeypatch)
+
+    assert errors == {"wandb": "offline fallback after CommError: 503"}
+
+
+def test_wandb_offline_fallback_lands_in_state_json(tmp_path: Path, train: MagicMock) -> None:
+    final = _finished_run(tmp_path)
+    train.return_value = (final, 2.0, {"wandb": "offline fallback after CommError: 503"})
+
+    state = train_run(SPEC, tmp_path, DEPS)
+
+    assert state.uploads == {"wandb": "offline fallback after CommError: 503"}
+    assert expect(load_state(RunPaths(tmp_path, SPEC).state_file), "state").uploads == state.uploads
+
+
+def test_wandb_tags_name_the_env_count_and_seed() -> None:
+    assert train_mod.wandb_tags(RunSpec("main", 64, 2, 45.0)) == ["n00064", "seed2"]

@@ -80,3 +80,25 @@ def test_store_config_accepts_real_mjlab_env_cfg(
         assert "algorithm" in wandb.run.config["train_cfg"]
     finally:
         wandb.finish()
+
+
+def test_every_iteration_metric_survives_rsl_rl_time_series(tmp_path: Path) -> None:
+    """rsl_rl 5.4.2 writes ``Train/*/time`` at step=int(tot_time) after each iteration's metrics.
+
+    Real wandb (offline) drops a step lower than the current one, so without the ``/time`` drop the summary
+    would stay at iteration 0's value. The summary holds the last *committed* row: steps 0-3 (step 4 commits
+    at finish), so it reads 3.
+    """
+    writer = ResumableWandbWriter(str(tmp_path / "logs"), "mprl-tests", RUN_ID, "g", mode="offline")
+    try:
+        for it in range(5):
+            writer.add_scalar("Train/mean_reward", float(it), it)
+            writer.add_scalar("Perf/train_clock_minutes", it * 0.5, it)
+            writer.add_scalar("Train/mean_reward/time", float(it), 30)
+        assert wandb.run is not None
+        summary = dict(wandb.run.summary)
+    finally:
+        writer.stop()
+    assert summary["Train/mean_reward"] == 3
+    assert summary["_step"] == 3
+    assert "Train/mean_reward/time" not in summary

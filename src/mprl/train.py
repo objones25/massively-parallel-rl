@@ -40,7 +40,7 @@ from mprl.paths import RunPaths
 from mprl.publish import export_onnx, hub_path, raise_if_sigterm_received, upload_run
 from mprl.run_state import RunState, load_state, save_state
 from mprl.tasks import load_task_env_cfg, load_task_rl_cfg
-from mprl.wandb_writer import logger_cfg
+from mprl.wandb_writer import CLOCK_METRIC, ResumableWandbWriter, logger_cfg
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnvCfg
@@ -54,6 +54,7 @@ _REPO_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_WANDB_PROJECT = "mprl-humanoid-walk"  # .env.example default (plan, Task 14)
 _ONNX_KEY = "onnx"  # state.uploads keys for errors that are not uploads
 _POST_TRAINING_KEY = "post_training"
+_WANDB_KEY = "wandb"  # the run's W&B fell back to offline mode (``ResumableWandbWriter.offline_fallback``)
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,14 @@ def failed_after_final_checkpoint(
     return bool(saved) and elapsed_s >= budget_s and saved[-1].iteration == current_iteration
 
 
+def wandb_tags(spec: RunSpec) -> list[str]:
+    """W&B tags ``n<5-digit num_envs>`` and ``seed<seed>``: the group stays the sweep, so all counts compare in one
+    group, and a tag (or ``config.run.num_envs``) filters or groups by count inside it."""
+    require(spec.num_envs > 0, f"num_envs must be positive, got {spec.num_envs}")
+    require(spec.seed >= 0, f"seed must be non-negative, got {spec.seed}")
+    return [f"n{spec.num_envs:05d}", f"seed{spec.seed}"]
+
+
 def wandb_logger_cfg(
     spec: RunSpec,
     wandb_run_id: str,
@@ -182,7 +191,12 @@ def wandb_logger_cfg(
     if environ.get("MPRL_IMAGE_DIGEST"):
         extra["image_digest"] = environ["MPRL_IMAGE_DIGEST"]
     cfg = logger_cfg(
-        environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT), wandb_run_id, spec.sweep, resume_from_iteration, mode
+        environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT),
+        wandb_run_id,
+        spec.sweep,
+        resume_from_iteration,
+        mode,
+        tags=wandb_tags(spec),
     )
     cfg["extra_config"] = extra
     if environ.get("WANDB_ENTITY"):
@@ -341,6 +355,9 @@ def _learn(
     def on_iteration(it: int) -> None:
         raise_if_sigterm_received()  # stop at the iteration end even if a library swallowed the Terminated
         diag_on_iteration(it)
+        writer = runner.logger.writer
+        if writer is not None:  # off the clock: a float the clock already holds, no device sync
+            writer.add_scalar(CLOCK_METRIC, clock.elapsed_minutes, it)
 
     diag.attach()
     try:
@@ -363,7 +380,7 @@ def _learn(
             raise
         log.warning("%s: post-training step failed after the final checkpoint: %s", spec.run_id, error)
         # The writer stop runs before the export, so its failure skipped the ONNX: export it here.
-        errors = {_POST_TRAINING_KEY: f"{type(error).__name__}: {error}"}
+        errors = {_POST_TRAINING_KEY: f"{type(error).__name__}: {error}", **_wandb_notes(runner)}
         onnx_error = export_onnx(runner, saved[-1])
         if onnx_error is not None:
             errors[_ONNX_KEY] = onnx_error
@@ -371,4 +388,12 @@ def _learn(
     finally:
         diag.detach()
     require(result.final == saved[-1], "learn_for's final checkpoint was not reported to on_checkpoint")
-    return result.final, clock.elapsed_s, {}
+    return result.final, clock.elapsed_s, _wandb_notes(runner)
+
+
+def _wandb_notes(runner: TimedOnPolicyRunner) -> dict[str, str]:
+    """``{"wandb": "offline fallback after <error>"}`` when the run's writer fell back to offline, else ``{}``."""
+    writer = runner.logger.writer
+    if isinstance(writer, ResumableWandbWriter) and writer.offline_fallback is not None:
+        return {_WANDB_KEY: f"offline fallback after {writer.offline_fallback}"}
+    return {}
