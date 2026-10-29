@@ -1,0 +1,22 @@
+# Packages in uv.lock that the Docker base image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404)
+# already ships in its system site-packages. docker/Dockerfile and scripts/setup.sh pass each name to
+# `uv sync --no-install-package`, so /opt/venv (created with --system-site-packages) uses the base's
+# copies instead of downloading them again. tests/unit/test_base_provided_packages.py keeps this list
+# equal to the torch / torchvision / triton / nvidia-* entries of uv.lock. One name per line.
+nvidia-cublas-cu12
+nvidia-cuda-cupti-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-cufile-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-cusparselt-cu12
+nvidia-nccl-cu12
+nvidia-nvjitlink-cu12
+nvidia-nvtx-cu12
+torch
+torchvision
+triton

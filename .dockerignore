@@ -1,0 +1,35 @@
+# Keep the build context small and secret-free. docker/ stays in: the build runs docker/uv-sync-base.sh
+# and docker/verify_image.py.
+.git
+.gitignore
+.dockerignore
+.github
+.superpowers
+.venv
+.venv.nosync
+.venv-icloud-old
+venv
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pdf
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.hypothesis
+.ruff_cache
+.mypy_cache
+.coverage
+coverage.xml
+htmlcov
+dist
+build
+*.egg-info
+logs
+wandb
+mlruns
+.idea
+.vscode
+.DS_Store

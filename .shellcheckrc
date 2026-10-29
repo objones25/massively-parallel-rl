@@ -1,0 +1,18 @@
+# Default ShellCheck config for this skill. Copy to your repo root as .shellcheckrc.
+# ShellCheck uses the first .shellcheckrc found walking up from each script.
+# No shell= line on purpose: ShellCheck picks the dialect from each file's shebang, so
+# #!/bin/sh scripts still get bashism warnings (SC3xxx).
+external-sources=true
+source-path=SCRIPTDIR
+
+# Catch the places where set -e silently stops applying:
+# SC2310/SC2311 (function called in if/&&/||/$(...)) and SC2312 (status masked by $(...)).
+enable=check-set-e-suppressed
+enable=check-extra-masked-returns
+
+# Small, uncontroversial extras.
+enable=deprecate-which
+enable=avoid-nullary-conditions
+
+# Not enabled on purpose: require-variable-braces and quote-safe-variables are style
+# choices; the ShellCheck wiki advises against enable=all as a default.
