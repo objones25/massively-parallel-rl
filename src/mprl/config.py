@@ -10,6 +10,7 @@ from typing import Final
 from mprl.negative_space import require
 
 TASK_ID: Final = "Mjlab-Velocity-Flat-Unitree-G1"
+CHECKPOINT_EVERY_MINUTES: Final = 3.0  # the default checkpoint interval of a run and a sweep
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,7 @@ class RunSpec:
     num_envs: int
     seed: int
     budget_minutes: float
-    checkpoint_every_minutes: float = 3.0
+    checkpoint_every_minutes: float = CHECKPOINT_EVERY_MINUTES
     task_id: str = TASK_ID
 
     def __post_init__(self) -> None:
@@ -51,7 +52,7 @@ class SweepSpec:
     env_counts: tuple[int, ...] = (64, 256, 1024, 4096, 16384)
     seeds: tuple[int, ...] = (0, 1, 2)
     budget_minutes: float = 45.0
-    checkpoint_every_minutes: float = 3.0
+    checkpoint_every_minutes: float = CHECKPOINT_EVERY_MINUTES
     eval_every_minutes: float = 3.0
     long_run_envs: int = 4096
     long_run_minutes: float = 180.0

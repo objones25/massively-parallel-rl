@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # train.sh: run an `mprl` subcommand in the image's environment; with no arguments, the main sweep
-# (`mprl sweep --name main`). The CLI loads .env itself, resumes every run from its latest
+# reusing the pilot (`mprl sweep --name main --reuse-pilot`; the reuse is refused, with the reason, unless
+# the pilot is complete on the same code). The CLI loads .env itself, resumes every run from its latest
 # checkpoint on the volume, and terminates the pod when training ends unless --no-terminate is given.
 #
 # Usage: scripts/train.sh [mprl subcommand and options]   e.g. scripts/train.sh pilot
@@ -22,7 +23,7 @@ die() {
 
 main() {
   local repo
-  if [[ $# -eq 0 ]]; then set -- sweep --name main; fi
+  if [[ $# -eq 0 ]]; then set -- sweep --name main --reuse-pilot; fi
   repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || die "cannot find the repo root"
   cd -- "$repo" || die "cannot cd to $repo"
   if [[ -z ${UV_PROJECT_ENVIRONMENT:-} && -d $IMAGE_VENV ]]; then

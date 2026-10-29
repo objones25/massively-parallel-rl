@@ -32,7 +32,7 @@ from dotenv import dotenv_values, load_dotenv
 from huggingface_hub import HfApi
 
 from mprl.budget import PRICE_PER_HOUR, CostEstimate, check_price, load_measurements, save_measurements
-from mprl.config import RunSpec, SweepSpec
+from mprl.config import SweepSpec
 from mprl.curves import METRICS
 from mprl.env_file import parse_env_example, prompt_values, render_env, write_env
 from mprl.errors import EnvDoesNotFit, MeasurementMissing, MissingSecret, MprlOperatingError, PreflightFailed
@@ -44,7 +44,7 @@ from mprl.preflight import default_checks, run_checks
 from mprl.publish import PodGuard, sigterm_raises
 from mprl.results import build_results
 from mprl.runpod import own_terminator
-from mprl.sweep import PILOT_MINUTES, configured_sweep, run_pilot, run_sweep
+from mprl.sweep import PILOT_MINUTES, configured_run, configured_sweep, run_pilot, run_sweep
 from mprl.throughput import measure_eval_seconds, measure_throughput
 from mprl.train import TrainDeps, train_run
 
@@ -182,9 +182,9 @@ class TrainRun:
     wandb_mode: WandbMode = "online"
 
     def run(self) -> int:
+        spec = configured_run(self.sweep, num_envs=self.num_envs, seed=self.seed, minutes=self.minutes)
         with _pod_guard(self.no_terminate) as guard:
             deps = _deps(self.device, self.wandb_mode)
-            spec = RunSpec(self.sweep, self.num_envs, self.seed, self.minutes)
             guard.states.append(train_run(spec, volume_root(os.environ), deps))
         return 0
 

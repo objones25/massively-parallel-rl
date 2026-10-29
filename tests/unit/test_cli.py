@@ -580,3 +580,31 @@ def test_pilot_prints_its_cost_at_the_given_price(
     assert _main("pilot", "--price-per-hour", "2.00") == 0
 
     assert "pilot: 45 training minutes at 4096 envs, $1.50 at $2.00/h before off-clock overhead" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (("--num-envs", "64", "--seed", "0", "--minutes", "1"), "--minutes must be a finite number of at least 3"),
+        (("--num-envs", "64", "--seed", "0", "--minutes", "nan"), "--minutes must be a finite number of at least 3"),
+        (("--num-envs", "0", "--seed", "0", "--minutes", "3"), "--num-envs must be positive, got 0"),
+        (("--num-envs", "64", "--seed", "-1", "--minutes", "3"), "--seed must be non-negative, got -1"),
+    ],
+)
+def test_train_run_bad_option_refuses_before_the_pod_guard(
+    root: Path,
+    terminator: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+    message: str,
+) -> None:
+    """A typo is InvalidInput (exit 1, pod kept), not a CheckFailed inside the guard that deletes the pod."""
+    train = create_autospec(train_run)
+    monkeypatch.setattr(cli, "train_run", train)
+
+    assert _main("train-run", "--sweep", "dbg", *argv) == 1
+
+    assert f"mprl: InvalidInput: {message}" in capsys.readouterr().err
+    train.assert_not_called()
+    terminator.terminate.assert_not_called()

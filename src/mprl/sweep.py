@@ -38,7 +38,7 @@ from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any, Final
 
 from mprl.budget import NEVER_DROPPED, PRICE_PER_HOUR, CostEstimate, Measurements, plan_within_budget
-from mprl.config import SweepSpec
+from mprl.config import CHECKPOINT_EVERY_MINUTES, RunSpec, SweepSpec
 from mprl.errors import EnvDoesNotFit, InvalidInput, MeasurementMissing
 from mprl.negative_space import require
 from mprl.paths import RunPaths, sweep_results_dir
@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from mprl.config import RunSpec
     from mprl.runpod import PodTerminator
     from mprl.train import TrainDeps
 
@@ -87,6 +86,25 @@ def configured_sweep(
             f"got {long_run_minutes}"
         )
     return replace(SweepSpec(name), seeds=seeds, budget_minutes=budget_minutes, long_run_minutes=long_run_minutes)
+
+
+def configured_run(sweep: str, *, num_envs: int, seed: int, minutes: float) -> RunSpec:
+    """``RunSpec`` for ``train-run``; ``InvalidInput`` naming the option for a bad value (checked before the pod
+    guard, so a typo keeps the pod instead of deleting it on a ``CheckFailed``)."""
+    every = CHECKPOINT_EVERY_MINUTES  # train-run uses RunSpec's default interval
+    if not sweep:
+        raise InvalidInput("--sweep must be non-empty")
+    if num_envs <= 0:
+        raise InvalidInput(f"--num-envs must be positive, got {num_envs}")
+    if seed < 0:
+        raise InvalidInput(f"--seed must be non-negative, got {seed}")
+    if not (math.isfinite(minutes) and minutes >= every):
+        raise InvalidInput(
+            f"--minutes must be a finite number of at least {every:g} (one checkpoint interval), got {minutes}"
+        )
+    spec = RunSpec(sweep, num_envs, seed, minutes)
+    require(spec.checkpoint_every_minutes == every, "train-run's checkpoint interval is not RunSpec's default")
+    return spec
 
 
 def pilot_spec(sweep: SweepSpec) -> RunSpec:

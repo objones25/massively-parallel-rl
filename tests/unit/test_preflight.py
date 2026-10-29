@@ -107,7 +107,10 @@ def test_check_runpod_reads_own_pod() -> None:
 
     detail = check_runpod(env, _client(200, {"status": "RUNNING"}, seen))
 
-    assert detail == f"pod {POD} is RUNNING; API key accepted"
+    assert detail == (
+        f"pod {POD} is RUNNING; API key accepted for GET only: self-termination (DELETE) needs a key with "
+        '"All" permission, which this check does not prove'
+    )
     assert [(r.method, r.url.path, r.headers["Authorization"]) for r in seen] == [
         ("GET", f"/v2/pods/{POD}", "Bearer rpa_key")
     ]

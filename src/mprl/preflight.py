@@ -134,7 +134,10 @@ def check_hf(env: Mapping[str, str]) -> str:
 
 
 def check_runpod(env: Mapping[str, str], client: httpx.Client | None = None) -> str:
-    """The own pod id resolves and a GET of that pod with RUNPOD_API_KEY returns 200."""
+    """The own pod id resolves and a GET of that pod with RUNPOD_API_KEY returns 200.
+
+    A GET is all a check may do (a DELETE would end the pod), so a Read Only key passes; the detail says so.
+    """
     if client is None:
         with httpx.Client(timeout=_RUNPOD_TIMEOUT_S) as owned:
             return check_runpod(env, owned)
@@ -145,7 +148,10 @@ def check_runpod(env: Mapping[str, str], client: httpx.Client | None = None) -> 
         raise PreflightFailed(str(error)) from error
     if status is None:
         raise PreflightFailed(f"pod {terminator.pod_id} not found (HTTP 404); is RUNPOD_POD_ID this pod's id?")
-    return f"pod {terminator.pod_id} is {status}; API key accepted"
+    return (
+        f"pod {terminator.pod_id} is {status}; API key accepted for GET only: self-termination (DELETE) needs a key "
+        'with "All" permission, which this check does not prove'
+    )
 
 
 def check_volume(env: Mapping[str, str]) -> str:
