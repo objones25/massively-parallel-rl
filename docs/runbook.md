@@ -43,8 +43,8 @@ it on the command line, `--price-per-hour <price>`, to both `pilot` (its printed
 the $40 cap check). Never edit the code instead: a code change after the pilot changes the git sha, and then the
 pilot can no longer stand in for a sweep run.
 
-Running total by step, at $1.79/h, before the measured overhead. The sweep's printed estimate replaces rows B and C
-once `measurements.json` exists.
+Running total by step: the expected spend at $1.79/h, before the measured overhead. The sweep's printed
+estimate is the cap check, and it is deliberately higher than rows B and C (section 6 says by how much).
 
 | Step | Hours | Cost | Running total |
 | --- | --- | --- | --- |
@@ -136,8 +136,14 @@ runpodctl pod create --name mprl-a --cloud-type SECURE --gpu-id "NVIDIA A100-SXM
 runpodctl ssh info <pod id>
 ```
 
+`date -u -v+3H` is the macOS (BSD) form. On Linux (GNU date) write the deadline as
+`"$(date -u -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)"`.
+
 Then SSH in with the printed command. Run long commands inside `tmux`, so a dropped SSH connection does not kill
-training (SIGHUP would end the process without terminating the pod, and the idle pod would keep billing):
+training (SIGHUP would end the process without terminating the pod, and the idle pod would keep billing). The
+install line is a no-op if the image already has it; otherwise it installs Ubuntu 24.04's `tmux` package (3.4 in
+noble, checked on Launchpad 2026-10-28). The pod's web terminal is an alternative for short sessions, but it also
+dies with the browser tab, so prefer tmux for the pilot and the sweep:
 
 ```
 command -v tmux || (apt-get update && apt-get install -y tmux)
@@ -193,11 +199,13 @@ uv run --no-sync pytest -m smoke tests/smoke/test_render.py tests/smoke/test_mjl
 A failure here is fixed before results (session C), not before training: training never renders.
 
 **Network tests** (never run yet). Tests marked `network` read the keys from the environment (`tests/conftest.py`
-strips `WANDB_*`, `HF_*` and `RUNPOD_*` only from the other tiers), so export `.env` into the shell. `RUNPOD_POD_ID`
-is only in PID 1's environment, so export it from there:
+strips `WANDB_*`, `HF_*` and `RUNPOD_*` only from the other tiers), so export `.env` into the shell. The first line
+parses `.env` with python-dotenv, the same loader the CLI uses, and prints shell-quoted `export` lines, so values
+containing `$`, spaces or `#` survive. `RUNPOD_POD_ID` is only in PID 1's environment, so the second line exports
+it from there:
 
 ```
-set -a; . ./.env; set +a
+eval "$(uv run --no-sync python -c 'import shlex, sys; from dotenv import dotenv_values; [print("export " + k + "=" + shlex.quote(v or "")) for k, v in dotenv_values(sys.argv[1]).items()]' .env)"
 export RUNPOD_POD_ID=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^RUNPOD_POD_ID=//p')
 uv run --no-sync pytest -m network -v --no-cov --deselect tests/network/test_runpod_terminate.py
 ```
@@ -288,9 +296,12 @@ scripts/train.sh sweep --name main --seeds 0 1 --budget-minutes 67
 
 A budget over 45 minutes means the 45-minute pilot cannot stand in for `main-n04096-s0`, so that run trains too
 (the sweep says why; `--reuse-pilot` is harmless). `--long-run-minutes` changes the long run (at least 45, the
-pilot it resumes). Run ids do not change with the budget, so use a new `--name` (for example `main67`) if a
-45-minute sweep was already started under `main`, and pass the same name to `results`. The estimate and the
-cut confirmation work as below.
+pilot it resumes). **Keep the name `main`.** The long run is `<name>-long-n04096-s0` and the pilot is
+`main-long-n04096-s0`, so only `--name main` resumes the pilot; any other name trains its long run from zero, 180
+minutes instead of 135 (+0.75 h, +$1.34 at $1.79/h). The budget options need no new name: the gate is decided
+before any sweep run exists, and if a `main` run had already finished at 45 minutes, a larger `--budget-minutes`
+continues it on the same clock and W&B run (the config hash leaves the budget out). The estimate and the cut
+confirmation work as below.
 
 ## 6. Session B: the sweep (Paid, about 13 h, running total about $25.52)
 
@@ -308,14 +319,20 @@ Re-run `setup.sh` on **every** new pod: the image's `/opt/venv` points its edita
 (`/opt/mprl`, no `.git`, no `.env`) until setup re-syncs it to the clone. Press Enter at every prompt to keep `.env`.
 
 The sweep first prints the estimate: one line each for setup (4.25 h), the sweep runs × minutes × (1 + io), the
-long run's remaining minutes × (1 + io), and the evaluations × measured seconds, then the total hours and dollars.
+long run as `180 of 180 min left` × (1 + io), and the evaluations × measured seconds, then the total hours and
+dollars. It is conservative on purpose. It costs the whole project against the $40 cap, so setup (session A,
+already spent) is included. It costs the long run in full, although the pilot already trained its first 45
+minutes. It also costs `main-n04096-s0` even when the pilot stands in for it. At $1.79/h and io = 0 the last two
+add 2 × 0.75 h = 1.5 h, about $2.69, over the spend in section 1's rows B and C. A plan it accepts therefore fits
+the cap with that margin.
+
 With no cut needed it starts training at once. With cuts it lists them and asks `Train with these cuts? [y/N]`;
 `N` keeps the pod running and trains nothing. `--yes` accepts the cuts without asking (they are still printed);
 without a terminal and without `--yes`, it refuses. Over $40 after every cut, it refuses to start.
 
 `--reuse-pilot` lets the pilot stand in for `main-n04096-s0` when HEAD equals the pilot's git sha, the configs
 match, and the pilot is complete at 45 minutes; otherwise it prints why not and trains that run too (+0.75 h,
-+$1.34). The estimate still counts that run, so it errs high. Then every run trains count-major (64 first), then
++$1.34). Then every run trains count-major (64 first), then
 the long run resumes the pilot to 180 minutes (90 with `long_run_half`). Completed runs are skipped; each run
 uploads its final checkpoint to Hugging Face when it ends. When everything is done or anything fails, the pod
 deletes itself after the uploads have finished or been recorded as failed.

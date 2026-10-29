@@ -205,8 +205,11 @@ live in `tests/support.py` (`tests` is on pytest's pythonpath). `tests/gpu` (ski
 sync count, two PPO iterations at 4096 envs with finite losses, and a checkpoint round trip under `MPRL_VOLUME_ROOT`.
 
 `tests/smoke/test_mjlab_cpu.py` pins mjlab 1.6.0 env stepping and rendering on CPU with 4 envs; rsl_rl 5.4.2
-`learn`/`load` are pinned through our runner in `tests/smoke/test_timed_runner.py`. Verified 2026-10-27 on macOS
-arm64 and Linux x86_64 CPU (`python:3.12` under `--platform linux/amd64`). Linux needs system libraries before
+`learn`/`load` are pinned through our runner in `tests/smoke/test_timed_runner.py`. On 2026-10-27 only the original
+mjlab CPU smoke tests (`test_mjlab_cpu.py`) were run by hand on macOS arm64 and on Linux x86_64 CPU (`python:3.12`
+under `--platform linux/amd64`). Since then CI (`tests.yml`, `ubuntu-latest`, Linux x86_64 CPU) runs the full fast
+and smoke tiers on every push, so that is the standing Linux check. On the Mac, the smoke tier is whatever was run
+locally last. Linux needs system libraries before
 `import mjlab.tasks` works: `libegl1 libgl1 libglib2.0-0` (the plain `python:3.12` image fails at import with
 `AttributeError: 'NoneType' object has no attribute 'eglQueryString'` from PyOpenGL). The Dockerfile installs
 them. The fast tier needs no system libraries beyond the venv.
