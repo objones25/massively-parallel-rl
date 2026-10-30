@@ -193,7 +193,7 @@ tests/unit/…, tests/smoke/…, tests/network/…, tests/gpu/…
   - Wrap the rollout + `compute_returns` and the `update()` in **two separate** `clock.measure()` blocks. This leaves a gap between them where Task 5 can snapshot weights off the clock.
   - Replace the iteration-count save with `next_checkpoint_due` + `store.save_atomic(self.save, ...)`. The final iteration's checkpoint is always saved.
   
-  Pass `init_at_random_ep_len` only when `fresh_start`. Call `self.logger.init_logging_writer()` once, and `stop_logging_writer()` at the end. Bound the loop with `max_iterations` via `require`. `overshoot_s = clock.elapsed_s - budget_s`. Add a header comment naming the rsl_rl version and file it mirrors, plus a smoke test that fails if `rsl_rl.__version__` / package metadata differs from `5.4.2`, so an upgrade forces a re-check.
+  Randomize episode lengths (`init_at_random_ep_len`) on every call, resumed too, as mjlab's train script does: a checkpoint does not hold `episode_length_buf`. Call `self.logger.init_logging_writer()` once, and `stop_logging_writer()` at the end. Bound the loop with `max_iterations` via `require`. `overshoot_s = clock.elapsed_s - budget_s`. Add a header comment naming the rsl_rl version and file it mirrors, plus a smoke test that fails if `rsl_rl.__version__` / package metadata differs from `5.4.2`, so an upgrade forces a re-check.
 - [ ] **Step 5: Run.** Expected: PASS. Then the gates.
 - [ ] **Step 6: Commit** `feat: time-budgeted runner with training-clock checkpoints`.
 

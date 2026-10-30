@@ -303,6 +303,25 @@ def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, sto
     assert torch.load(result.final.path, weights_only=False)["infos"]["clock"] == {"elapsed_s": clock.elapsed_s}
 
 
+def test_resume_in_fresh_runner_randomizes_episode_lengths(build: Build, store: CheckpointStore) -> None:
+    # A checkpoint does not hold episode_length_buf, so a resumed env starts every episode at 0. Without
+    # mjlab's init_at_random_ep_len on resume, all envs time out on the same iteration from then on.
+    _, first = build(name="first")
+    first.learn_for(TrainingClock(), LONG_S, LONG_S, store, fresh_start=True, max_iterations=1)
+    loaded = expect(store.latest(), "first run saved no checkpoint")
+    resumed_env, resumed = build(name="resumed")
+    resumed.load(str(loaded.path))
+    lengths_after_first_rollout: list[torch.Tensor] = []
+
+    resumed.learn_for(
+        TrainingClock(), LONG_S, LONG_S, store, fresh_start=False, max_iterations=1,
+        on_before_update=lambda _: lengths_after_first_rollout.append(resumed_env.episode_length_buf.clone()),
+    )
+
+    # Unrandomized, no env could be past the first rollout's STEPS_PER_ITERATION steps.
+    assert int(lengths_after_first_rollout[0].max()) > STEPS_PER_ITERATION
+
+
 STEP_COST_S = 1.0  # fake seconds each env.step takes
 UPDATE_COST_S = 1000.0  # fake seconds each alg.update takes
 SAVE_COST_S = 100000.0  # fake seconds each checkpoint write takes (test_io_is_off_the_clock)

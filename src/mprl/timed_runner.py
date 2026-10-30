@@ -18,6 +18,8 @@
 5. A resumed run (``fresh_start=False``) starts at ``current_learning_iteration + 1``. Upstream
    restarts at the loaded index, which re-labels that iteration: a duplicate logger step and a
    second checkpoint file with the same iteration.
+   Episode lengths are randomized on every call, fresh or resumed, as mjlab's train script does
+   (``learn(..., init_at_random_ep_len=True)`` after ``runner.load``).
 
 ``tests/smoke/test_timed_runner.py::test_rsl_rl_version_is_the_one_learn_for_mirrors`` fails on any
 other rsl-rl-lib version, so an upgrade forces a re-read of the upstream loop.
@@ -94,9 +96,11 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
     ) -> LearnResult:
         """Train until ``clock`` reaches ``budget_s`` (checked after each iteration) or ``max_iterations``.
 
-        ``fresh_start`` randomizes initial episode lengths (upstream ``init_at_random_ep_len``); a
-        resumed run must pass False so it does not re-randomize mid-training, and then continues at
-        the iteration after the loaded one.
+        Initial episode lengths are always randomized (upstream ``init_at_random_ep_len``, which
+        mjlab's train script passes on resume too): a checkpoint does not hold ``episode_length_buf``,
+        so a resumed env starts every episode at 0 and, unrandomized, all envs would time out on the
+        same iteration. ``fresh_start=False`` (a resumed run) continues at the iteration after the
+        loaded one.
         """
         check_finite(budget_s, "budget_s")
         check_finite(checkpoint_every_s, "checkpoint_every_s")
@@ -114,10 +118,9 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
         self.cfg["upload_model"] = False  # never upload from inside the loop; see header item 4
 
         # --- upstream setup (off the clock) ---
-        if fresh_start:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
+        self.env.episode_length_buf = torch.randint_like(
+            self.env.episode_length_buf, high=int(self.env.max_episode_length)
+        )
         obs = self.env.get_observations().to(self.device)
         self.alg.train_mode()
         if self.is_distributed:
