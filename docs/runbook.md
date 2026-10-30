@@ -174,8 +174,26 @@ writes `.env`, then runs the preflight. Every line must say PASS:
 - `env`: the G1 task builds with 2 envs on `cuda:0` and steps 4 times with finite rewards.
 - `wandb`: the key is accepted; prints the entity and project.
 - `hf`: the token is accepted and `HF_REPO_ID` exists (created private if absent).
+- `python-env`: torch is the base's (not under `/workspace` or the repo `.venv`), the venv is off the volume,
+  `UV_CACHE_DIR` is off the volume and `UV_NO_SYNC` is set.
+- `egl`: `libEGL.so.1` loads (MuJoCo's headless rendering for the videos).
 - `runpod`: the pod id resolves (`RUNPOD_POD_ID`, else `/proc/1/environ`) and a GET of this pod returns 200.
-- `volume`: a probe file under `/workspace/mprl` is written, read back and deleted.
+- `volume`: the volume root is on a mount other than `/`, and a probe file under `/workspace/mprl` is written, read
+  back and deleted.
+
+`hf` also fails a read-only token. An `ImportError`, `AttributeError` or `OSError` inside a check is a FAIL line for
+that check, not a traceback.
+
+**Stock image.** The project image is the intended one, but a pod from RunPod's stock PyTorch 2.8.0 image
+(`runpod/pytorch:*-cu1281-torch280-ubuntu2404`) also works: `setup.sh` creates `/opt/venv` with
+`--system-site-packages` from `/usr/bin/python3.12` (whose site-packages hold torch), moves `UV_CACHE_DIR` off the
+volume (the stock image points it at `/workspace/.cache/uv/`), installs `libegl1` if `libEGL.so.1` does not load,
+and writes `/etc/profile.d/mprl-uv.sh` so later SSH / tmux login shells use `/opt/venv` and never sync. In the shell
+you ran `setup.sh` from, run `. /etc/profile.d/mprl-uv.sh` once. It never installs onto the volume: a
+`UV_PROJECT_ENVIRONMENT` under `/workspace` is refused, and without torch in the system python it refuses and names
+the project image. (2026-10-30: a stock pod's old fallback re-downloaded torch into a `.venv` on the 30 GB volume
+and hit the quota mid-install. `df /workspace` shows the whole storage cluster, not your quota.) `setup.sh` needs a
+TTY (it prompts for keys).
 
 Re-run only some checks with `scripts/train.sh preflight --only cuda env`.
 
@@ -377,7 +395,20 @@ It logs everything to the W&B run `main-results` (the videos as `results/long_ru
 `results/long_run_train_minutes`), uploads the results to `results/main` and the videos to
 `results/main/long_run_videos` on Hugging Face, then deletes the pod. Evaluations and videos are cached per
 checkpoint, so a re-run evaluates and renders only what is new. Training is not touched: the videos come from
-checkpoints already on the volume.
+checkpoints already on the volume. The Hub's `long_run_videos` folder mirrors the local set (stale `*.mp4` are
+deleted). A long run whose `state.json` is missing or not `complete` is a WARNING and a card line, not a refusal.
+
+**Exit 1 means a publish failed** (W&B or Hub): `results_publish.json` names it, the pod is still deleted with
+`--terminate`, and re-running the same command retries; an unchanged W&B publish is not logged twice.
+
+**Training then results in one go** (e.g. finishing the long run first): chain with `;`, not `&&`, so the pod is
+deleted even when training fails (`results` runs with a warning on a failed long run):
+
+```
+scripts/train.sh train-run --sweep main-long --num-envs 4096 --seed 0 --minutes 90 --no-terminate; scripts/train.sh results --name main --primary-metric vel_error_xy --terminate
+```
+
+`results` still refuses before its pod guard without `RUNPOD_API_KEY` or a pod id; then the pod stays up.
 
 **Primary metric: `vel_error_xy`.** It is the one number that separates walking from standing: a robot that stands
 still scores 0.5 m/s on it but can score 1.0 on `no_fall_fraction`. `mean_time_to_fall_s` saturates at the 10 s
@@ -397,7 +428,12 @@ scripts/train.sh <the same command as before>
 Resume is automatic: completed runs are skipped, a partial run resumes from its latest complete checkpoint with
 the same training clock and W&B run id (a checkpoint is written atomically, so a kill mid-write never counts), and
 a complete run whose upload failed retries only the upload. A run whose stored config hash differs refuses to
-resume (`ConfigMismatch`) and names the cause. Do not `git pull` mid-project; the pilot reuse depends on the sha.
+resume (`ConfigMismatch`) and names the cause.
+A resume picks the newest checkpoint that passes a zip CRC check and unpickles; a damaged one is renamed
+`<name>.pt.corrupt`, noted in `state.json` `uploads["corrupt_checkpoint/<name>"]`, and the next older one is used.
+If none loads, it stops with `CheckpointsCorrupt` (nothing restarts from scratch silently). A resume re-randomizes
+episode lengths, as mjlab's train script does, so the logged episode metrics dip for about one episode (~42
+iterations at 24 steps), as at a fresh start. Do not `git pull` mid-project; the pilot reuse depends on the sha.
 
 **Where things live on the volume** (`mprl.paths`, root `/workspace/mprl`):
 
