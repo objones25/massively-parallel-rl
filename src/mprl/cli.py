@@ -1,7 +1,9 @@
 """The ``mprl`` command line (tyro subcommands). ``scripts/setup.sh`` and ``scripts/train.sh`` call it.
 
 ``.env`` (``$MPRL_ENV_FILE``, default the repo root's, written by ``setup``) is loaded at startup without
-overriding variables already set.
+overriding variables already set, by every command but ``setup``: ``setup`` rewrites it and runs its preflight
+with the same precedence (``env_file.effective_env``: the shell wins), warning by name about each key whose
+shell value differs from the one written.
 
 Termination: ``train-run``, ``pilot`` and ``sweep`` build the pod's ``PodTerminator`` before anything else
 (no key or no pod id: refuse, naming ``--no-terminate``). From then on one ``PodGuard`` terminates the pod
@@ -34,8 +36,15 @@ from huggingface_hub import HfApi
 from mprl.budget import PRICE_PER_HOUR, CostEstimate, check_price, load_measurements, save_measurements
 from mprl.config import SweepSpec
 from mprl.curves import METRICS
-from mprl.env_file import parse_env_example, prompt_values, render_env, write_env
-from mprl.errors import EnvDoesNotFit, MeasurementMissing, MissingSecret, MprlOperatingError, PreflightFailed
+from mprl.env_file import effective_env, parse_env_example, prompt_values, render_env, shell_overrides, write_env
+from mprl.errors import (
+    EnvDoesNotFit,
+    InvalidInput,
+    MeasurementMissing,
+    MissingSecret,
+    MprlOperatingError,
+    PreflightFailed,
+)
 from mprl.evaluator import EvalConfig
 from mprl.hub import HubPublisher
 from mprl.negative_space import require
@@ -109,22 +118,36 @@ class Setup:
     """Ask for the keys in .env.example, write .env (mode 0600), then run the preflight checks."""
 
     cpu: bool = False
-    """Skip the CUDA and RunPod checks (local testing)."""
+    """Skip the pod-only checks: CUDA, python-env, EGL, RunPod and the volume's mount (local testing)."""
 
     def run(self) -> int:
+        if not _interactive():
+            # getpass would fall back to echoing the secrets, and input() raises EOFError at the first key.
+            raise InvalidInput(
+                "setup asks for API keys and needs a terminal on stdin; run scripts/setup.sh in an interactive "
+                "shell (ssh -t, tmux), not piped or under nohup"
+            )
         vars = parse_env_example(ENV_EXAMPLE.read_text())
         env_file = _env_file()
         existing = dotenv_values(env_file) if env_file.exists() else {}
         values = prompt_values(vars, existing, ask=input, ask_secret=getpass.getpass)
         write_env(env_file, render_env(vars, values), overwrite=True)
         print(f"wrote {env_file} (mode 0600)")
-        return _preflight({**os.environ, **values}, require_gpu=not self.cpu, only=())
+        for name in shell_overrides(values, os.environ):
+            log.warning(
+                "%s is set in the shell and differs from %s; training uses the shell's value, so the checks do too",
+                name,
+                env_file,
+            )
+        return _preflight(effective_env(values, os.environ), require_gpu=not self.cpu, only=())
 
 
 def _preflight(env: dict[str, str], *, require_gpu: bool, only: Sequence[str]) -> int:
-    checks = [c for c in default_checks(env, require_gpu) if not only or c[0] in only]
+    checks = [c for c in default_checks(env, require_gpu, repo_dir=REPO_DIR) if not only or c[0] in only]
     if not checks:
-        raise PreflightFailed(f"--only {' '.join(only)} selects no check (--cpu skips cuda and runpod)")
+        raise PreflightFailed(
+            f"--only {' '.join(only)} selects no check (--cpu skips cuda, python-env, egl and runpod)"
+        )
     results = run_checks(checks)
     for result in results:
         print(f"{'PASS' if result.ok else 'FAIL'} {result.name}: {result.detail}")
@@ -133,11 +156,11 @@ def _preflight(env: dict[str, str], *, require_gpu: bool, only: Sequence[str]) -
 
 @dataclass(frozen=True)
 class Preflight:
-    """Check the GPU, the env, W&B, Hugging Face, RunPod and the volume; exit 1 if any check fails."""
+    """Check the GPU, the Python environment, EGL, the env, W&B, Hugging Face, RunPod and the volume; exit 1 on a FAIL."""
 
     cpu: bool = False
-    """Skip the CUDA and RunPod checks; the env check runs on CPU."""
-    only: tuple[Literal["cuda", "env", "wandb", "hf", "runpod", "volume"], ...] = ()
+    """Skip the pod-only checks (CUDA, python-env, EGL, RunPod, the volume's mount); the env check runs on CPU."""
+    only: tuple[Literal["cuda", "python-env", "egl", "env", "wandb", "hf", "runpod", "volume"], ...] = ()
     """Run only these checks (default: all)."""
 
     def run(self) -> int:
@@ -312,10 +335,11 @@ COMMANDS: Final = {
 
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    load_dotenv(_env_file(), override=False)
     command = tyro.extras.subcommand_cli_from_dict(
         COMMANDS, prog="mprl", args=argv, config=(tyro.conf.FlagCreatePairsOff,)
     )
+    if not isinstance(command, Setup):  # setup rewrites .env; os.environ stays the shell's (see Setup.run)
+        load_dotenv(_env_file(), override=False)
     try:
         return command.run()
     except MprlOperatingError as error:

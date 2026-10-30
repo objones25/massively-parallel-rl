@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
-from mprl.env_file import EnvVar, parse_env_example, prompt_values, render_env, write_env
+from mprl.env_file import (
+    EnvVar,
+    effective_env,
+    parse_env_example,
+    prompt_values,
+    render_env,
+    shell_overrides,
+    write_env,
+)
 from mprl.errors import InvalidInput
 from mprl.negative_space import CheckFailed
 
@@ -160,3 +168,23 @@ def test_prompt_values_gives_up_after_three_invalid_values() -> None:
 
     with pytest.raises(InvalidInput, match="HF_REPO_ID"):
         prompt_values(parsed, {}, ask=lambda _prompt: "bad value", ask_secret=lambda _prompt: "")
+
+
+# --- precedence: the shell wins over .env, as in training (load_dotenv(override=False)) -------------------
+
+
+def test_effective_env_takes_the_shell_value_over_the_env_file() -> None:
+    env = effective_env({"HF_REPO_ID": "file/repo", "WANDB_PROJECT": "p"}, {"HF_REPO_ID": "shell/repo", "PATH": "/bin"})
+
+    assert env == {"HF_REPO_ID": "shell/repo", "WANDB_PROJECT": "p", "PATH": "/bin"}
+
+
+def test_effective_env_keeps_an_empty_shell_value_as_load_dotenv_does() -> None:
+    assert effective_env({"WANDB_ENTITY": "team"}, {"WANDB_ENTITY": ""}) == {"WANDB_ENTITY": ""}
+
+
+def test_shell_overrides_names_only_keys_whose_shell_value_differs() -> None:
+    values = {"HF_TOKEN": "hf_file", "HF_REPO_ID": "same/repo", "WANDB_ENTITY": "team", "WANDB_PROJECT": "p"}
+    environ = {"HF_TOKEN": "hf_shell", "HF_REPO_ID": "same/repo", "WANDB_ENTITY": "", "PATH": "/bin"}
+
+    assert shell_overrides(values, environ) == ["HF_TOKEN", "WANDB_ENTITY"]
