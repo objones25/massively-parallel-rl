@@ -14,9 +14,10 @@ import pytest
 
 import mprl.sweep as sweep_mod
 import mprl.train
-from mprl.budget import CostEstimate, Measurements
+from mprl.budget import CostEstimate, Measurements, estimate
 from mprl.config import RunSpec, SweepSpec
 from mprl.errors import EnvDoesNotFit, InvalidInput, MeasurementMissing, TerminateFailed
+from mprl.negative_space import CheckFailed
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.run_state import RunState, save_state
 from mprl.runpod import PodTerminator
@@ -318,6 +319,46 @@ def test_sweep_refuses_unmeasured_counts(tmp_path: Path, train_run: MagicMock, t
 
     train_run.assert_not_called()
     terminator.terminate.assert_not_called()
+
+
+def test_keyboard_interrupt_during_the_sweep_still_terminates(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock
+) -> None:
+    """The sweep runs unattended, so Ctrl-C (or a KeyboardInterrupt from anywhere) does not keep the pod."""
+    train_run.side_effect = KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=terminator, reuse_pilot=False)
+
+    terminator.terminate.assert_called_once_with()
+
+
+def test_sweep_refuses_a_long_run_count_outside_the_planned_counts(
+    tmp_path: Path, train_run: MagicMock, terminator: MagicMock
+) -> None:
+    """Every sweep run uses a planned count; the long run's 4096 is not among (64,), so nothing trains."""
+    sweep = SweepSpec("main", env_counts=(64,), seeds=(0,))
+
+    with pytest.raises(CheckFailed, match=r"^a run uses an excluded or cut env count$"):
+        run_sweep(sweep, tmp_path, DEPS, _m(), confirm=_yes, terminator=terminator, reuse_pilot=False)
+
+    train_run.assert_not_called()
+
+
+@pytest.mark.parametrize(("reuse", "done_minutes"), [(True, 45.0), (False, 0.0)])
+def test_sweep_estimate_subtracts_the_reused_pilot_from_the_long_run(
+    tmp_path: Path, train_run: MagicMock, reuse: bool, done_minutes: float
+) -> None:
+    """A reused pilot is both the sweep's n=4096 s=0 run and the long run's first 45 min: counted once."""
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+    m = Measurements(36.0, 0.5, {64: True, 4096: True}, {64: 900.0, 4096: 250_000.0})
+
+    run_sweep(SMALL, tmp_path, DEPS, m, confirm=_yes, terminator=None, reuse_pilot=reuse)
+
+    manifest = json.loads((sweep_results_dir(tmp_path, "main") / "sweep_manifest.json").read_text())
+    expected = estimate(SMALL, m, long_run_done_minutes=done_minutes)
+    assert manifest["estimate"]["hours"] == pytest.approx(expected.total_hours)
+    assert manifest["estimate"]["usd"] == pytest.approx(expected.total_usd)
 
 
 def test_failed_termination_does_not_mask_the_training_error(

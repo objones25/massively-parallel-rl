@@ -7,7 +7,7 @@ point: absent, never zero.
 
 The curve is the mean across seeds with the min-max range as the band. With 3 seeds an IQM is just
 the median (with 2, the mean), so mean plus range says more; the chart caption states this with the
-actual seed count.
+actual seed count. A NaN metric value counts as no seed for the curve (mean, band and seed count).
 """
 
 from __future__ import annotations
@@ -76,14 +76,17 @@ def aggregate(
 ) -> list[CurvePoint]:
     """One point per (count, mark) with at least one seed; count-major, then by mark.
 
-    ``run_envs`` maps each run id of the sweep to its env count; results of other runs are ignored.
+    A NaN value is left out of the mean, the band and ``n_seeds`` alike; a mark where every seed is NaN
+    has no point. ``run_envs`` maps each run id of the sweep to its env count; results of other runs are ignored.
     """
     validate_metric(metric)
     points: list[CurvePoint] = []
     for num_envs in sorted(set(run_envs.values())):
         runs = [run_id for run_id, n in run_envs.items() if n == num_envs]
         for mark in marks_minutes:
-            values = [v for v, _ in _values_at(marked, runs, metric, mark)]
+            # NaN (a metric with no defined value, e.g. no standing env-step) is no seed: min()/max() with a
+            # NaN would depend on its position, and the mean would be NaN.
+            values = [v for v, _ in _values_at(marked, runs, metric, mark) if not math.isnan(v)]
             if values:
                 points.append(
                     CurvePoint(num_envs, float(mark), sum(values) / len(values), min(values), max(values), len(values))

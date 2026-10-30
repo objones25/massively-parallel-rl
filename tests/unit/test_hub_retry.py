@@ -97,5 +97,18 @@ def test_upload_forwards_arguments(api: HfApi, tmp_path: Path) -> None:
     _publisher(api, []).upload_folder(tmp_path, "ckpt", "msg")
 
     api.upload_folder.assert_called_once_with(  # type: ignore[attr-defined]
-        repo_id=REPO, folder_path=tmp_path, path_in_repo="ckpt", commit_message="msg", repo_type="model"
+        repo_id=REPO,
+        folder_path=tmp_path,
+        path_in_repo="ckpt",
+        commit_message="msg",
+        repo_type="model",
+        delete_patterns=None,
     )
+
+
+def test_upload_forwards_delete_patterns(api: HfApi, tmp_path: Path) -> None:
+    """huggingface_hub 2.3.0 ``upload_folder(delete_patterns=...)`` deletes the remote files under
+    ``path_in_repo`` that match and are not uploaded again in the same commit."""
+    _publisher(api, []).upload_folder(tmp_path, "videos", "msg", delete_patterns="*.mp4")
+
+    assert api.upload_folder.call_args.kwargs["delete_patterns"] == "*.mp4"  # type: ignore[attr-defined]

@@ -11,7 +11,10 @@ The long run (``<sweep>-long``) gets a rollout video at each of its evaluation m
 ``RACE_COMMAND`` (``EVAL_COMMANDS[1]``), written to the long run's ``videos/`` as
 ``t<mark minutes>min_it<iteration>.mp4``, cached by file name (a re-run renders only what is new and removes
 videos of checkpoints no longer marked), logged to the W&B results run and uploaded to
-``results/<sweep>/long_run_videos`` on the Hub. Training is untouched: this runs during ``results`` only.
+``results/<sweep>/long_run_videos`` on the Hub with ``delete_patterns="*.mp4"``, so the Hub folder mirrors the
+local set. Training is untouched: this runs during ``results`` only. A long run whose ``state.json`` is missing
+or not ``complete`` (it crashed, or is still resumable) is a WARNING and a line in the card; the results use the
+checkpoints it saved.
 
 Evaluation marks are every ``eval_every_minutes`` plus always the budget; race-video marks every
 ``checkpoint_every_minutes`` plus the budget. A mark takes the checkpoint that crossed it
@@ -21,7 +24,12 @@ iteration) in the run's ``eval/eval.csv``, with the ``EvalConfig`` hash in ``eva
 a row is reused only under the same config hash and while its training time still matches, so
 re-running evaluates only what is new. Everything is off the
 training clock. Publishing outcomes go to ``<sweep>/results_publish.json`` (next to the results dir, so
-it is not uploaded stale) and the log; a publish failure never touches the local results.
+it is not uploaded stale) and the log; a publish failure never touches the local results, but once every
+outcome is recorded it raises ``UploadFailed`` naming the failed targets (``mprl results`` exits 1; with
+``--terminate`` the pod is still terminated). ``"skipped: no publisher"`` (no ``HubPublisher`` given) is not a
+failure. An online W&B publish that succeeded records ``wandb_content`` (a SHA-256 of ``results.csv``,
+``README.md`` and the long-run video names); a re-run whose content is unchanged does not log the same media
+to the ``<sweep>-results`` run again (W&B appends on resume), so retrying a failed Hub upload re-logs nothing.
 """
 
 from __future__ import annotations
@@ -39,7 +47,6 @@ from typing import Any, Final
 
 import numpy as np
 import wandb
-from huggingface_hub.errors import HfHubHTTPError
 from wandb.errors import Error as WandbError
 
 from mprl.checkpoints import CheckpointRef, CheckpointStore
@@ -47,12 +54,13 @@ from mprl.config import TASK_ID, SweepSpec, batch_arithmetic
 from mprl.curves import aggregate, median_seed_run, plot_learning_curves, validate_metric
 from mprl.errors import UploadFailed
 from mprl.evaluator import EVAL_COMMANDS, EvalConfig, EvalResult, evaluate_checkpoint, read_eval_csv, write_eval_csv
-from mprl.hub import HubPublisher
+from mprl.hub import UPLOAD_ERRORS, HubPublisher
 from mprl.negative_space import bounded, require
 from mprl.paths import RunPaths, sweep_results_dir
 from mprl.race_video import race_frames, race_timeline, write_video
 from mprl.render import render_rollout
 from mprl.results_card import model_card
+from mprl.run_state import RunState, load_state, write_json_atomic
 from mprl.sweep import pilot_spec
 from mprl.tasks import load_task_rl_cfg
 from mprl.train import DEFAULT_WANDB_PROJECT
@@ -64,6 +72,8 @@ RACE_SECONDS_PER_MARK: Final = 4.0  # 15 marks x 4 s = a 60 s video at real time
 RACE_FPS: Final = 50  # 1 / step_dt (decimation 4 x 0.005 s): real time
 _MAX_MARKS: Final = 10_000
 _MARK_TOLERANCE_MIN: Final = 1e-9
+_NO_PUBLISHER: Final = "skipped: no publisher"  # the caller chose not to upload: not a failure
+_PUBLISH_FILE: Final = "results_publish.json"
 
 
 @dataclass(frozen=True)
@@ -171,8 +181,7 @@ def _write_eval_cache(results: Sequence[EvalResult], eval_csv: Path, cfg: EvalCo
     tmp = eval_csv.with_name(f".{eval_csv.name}.tmp")
     write_eval_csv(sorted(results, key=lambda r: r.iteration), tmp)
     os.replace(tmp, eval_csv)
-    config = {"config_hash": eval_config_hash(cfg), "eval_config": asdict(cfg)}
-    _config_file(eval_csv).write_text(json.dumps(config, indent=2) + "\n")
+    write_json_atomic(_config_file(eval_csv), {"config_hash": eval_config_hash(cfg), "eval_config": asdict(cfg)})
 
 
 def evaluate_source(
@@ -343,18 +352,74 @@ def publish_hub(
 ) -> str:
     """Upload the results dir, then the long-run videos dir when it holds any; "ok" or the error text."""
     if publisher is None:
-        return "skipped: no publisher"
+        return _NO_PUBLISHER
     try:
         publisher.ensure_repo()
         publisher.upload_folder(out, f"results/{sweep.name}", f"{sweep.name}: results")
         if long_run_videos is not None and any(long_run_videos.glob("*.mp4")):
             publisher.upload_folder(
-                long_run_videos, f"results/{sweep.name}/long_run_videos", f"{sweep.name}: long-run videos"
+                long_run_videos,
+                f"results/{sweep.name}/long_run_videos",
+                f"{sweep.name}: long-run videos",
+                delete_patterns="*.mp4",  # a video removed locally (no longer marked) goes from the Hub too
             )
-    except (UploadFailed, HfHubHTTPError, OSError) as error:
+    except UPLOAD_ERRORS as error:
         log.error("upload of %s results failed: %s", sweep.name, error)
         return f"{type(error).__name__}: {error}"
     return "ok"
+
+
+def long_run_problem(state: RunState | None) -> str:
+    """Why the long run is not ``complete`` (for the log and the card), or "" when it is."""
+    if state is None:
+        return "no `state.json`"
+    if state.status == "complete":
+        return ""
+    return f"`{state.status}` at {round(state.train_seconds / 60.0, 1):g} training minutes"
+
+
+def _wandb_content(out: Path, long_run_videos: Sequence[tuple[float, Path]]) -> str:
+    """SHA-256 of what the W&B results run shows: the CSV and card (which name the metric, the median runs and
+    the render length) and the long-run video names (mark and checkpoint iteration)."""
+    digest = hashlib.sha256()
+    for name in ("results.csv", "README.md"):
+        digest.update((out / name).read_bytes())
+    for mark, video in long_run_videos:
+        digest.update(f"{mark!r} {video.name}\n".encode())
+    return digest.hexdigest()
+
+
+def _publish(
+    planned: SweepSpec,
+    out: Path,
+    publisher: HubPublisher | None,
+    wandb_mode: str,
+    config: Mapping[str, Any],
+    long_videos: Sequence[tuple[float, Path]],
+    videos_dir: Path,
+) -> None:
+    """Publish to W&B (unless an online publish of the same content already succeeded) and the Hub, record the
+    outcomes in ``results_publish.json``, then raise ``UploadFailed`` naming every target that failed."""
+    publish_file = out.parent / _PUBLISH_FILE
+    previous = _read_json(publish_file)
+    content = _wandb_content(out, long_videos)
+    online = wandb_mode == "online"
+    if online and previous.get("wandb") == "ok" and previous.get("wandb_content") == content:
+        log.info("W&B run %s-results already holds these results; not logging them again", planned.name)
+        wandb_outcome = "ok"
+    else:
+        wandb_outcome = _publish_wandb(planned, out, wandb_mode, config, long_videos)
+    status = {"wandb": wandb_outcome, "hub": publish_hub(planned, out, publisher, long_run_videos=videos_dir)}
+    failed = {target: outcome for target, outcome in status.items() if outcome not in ("ok", _NO_PUBLISHER)}
+    if online and wandb_outcome == "ok":
+        status["wandb_content"] = content
+    write_json_atomic(publish_file, status)
+    if status["hub"] == _NO_PUBLISHER:
+        log.warning("sweep %s results: hub %s", planned.name, _NO_PUBLISHER)
+    if failed:
+        message = f"sweep {planned.name} results not published: " + "; ".join(f"{t}: {o}" for t, o in failed.items())
+        log.error("%s", message)
+        raise UploadFailed(f"{message} (local results in {out}; outcomes in {publish_file}; re-run to retry)")
 
 
 def build_results(
@@ -370,7 +435,7 @@ def build_results(
     render_size: tuple[int, int] = (360, 480),
 ) -> Path:
     """Evaluate, write ``results.csv``, the chart, ``race.mp4``, the long-run videos and ``README.md``, then
-    publish; the results dir."""
+    publish; the results dir. ``UploadFailed`` after everything is written when a publish failed."""
     validate_metric(primary_metric)
     cfg = eval_cfg or EvalConfig()
     _check_shipped_batch_config()
@@ -390,6 +455,12 @@ def build_results(
     median = median_seed_run(evals, primary_metric, run_envs, at_minutes=last)
     _render_race(sources, median, planned, out / "race.mp4", seconds=render_seconds, size=render_size, device=device)
     long_videos = render_long_run_videos(planned, root, seconds=render_seconds, size=render_size, device=device)
+    long_paths = RunPaths(root, planned.long_run())
+    problem = long_run_problem(load_state(long_paths.state_file))
+    if problem:
+        log.warning(
+            "long run %s did not complete (%s); results use the checkpoints it saved", long_paths.spec.run_id, problem
+        )
 
     reuse = _read_json(out / "pilot_reuse.json")
     card = model_card(
@@ -401,17 +472,10 @@ def build_results(
         final_points=[p for p in points if p.minutes == last],
         race=(RACE_COMMAND, render_seconds, last, median),
         long_run_video_marks=[mark for mark, _ in long_videos],
+        long_run_problem=problem,
     )
     (out / "README.md").write_text(card)
 
     config = {"sweep": planned.name, "primary_metric": primary_metric, "median_runs": median, "median_at": last}
-    videos_dir = RunPaths(root, planned.long_run()).videos_dir
-    status = {
-        "wandb": _publish_wandb(planned, out, wandb_mode, config, long_videos),
-        "hub": publish_hub(planned, out, publisher, long_run_videos=videos_dir),
-    }
-    (out.parent / "results_publish.json").write_text(json.dumps(status, indent=2) + "\n")
-    for target, outcome in status.items():
-        if outcome != "ok":
-            log.warning("sweep %s results %s: %s", planned.name, target, outcome)
+    _publish(planned, out, publisher, wandb_mode, config, long_videos, long_paths.videos_dir)
     return out

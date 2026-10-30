@@ -17,9 +17,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal
 
-from huggingface_hub.errors import HfHubHTTPError
-
-from mprl.errors import Terminated, UploadFailed
+from mprl.errors import Terminated
+from mprl.hub import UPLOAD_ERRORS
 from mprl.negative_space import require
 
 if TYPE_CHECKING:
@@ -78,7 +77,7 @@ def upload_run(publisher: HubPublisher, paths: RunPaths, final: CheckpointRef) -
         shutil.copy2(paths.state_file, staging / paths.state_file.name)
         publisher.ensure_repo()
         publisher.upload_folder(staging, hub_path(paths.spec), f"{paths.spec.run_id}: {final.path.name}")
-    except (UploadFailed, HfHubHTTPError, OSError) as error:
+    except UPLOAD_ERRORS as error:
         log.error("upload of %s to %s failed: %s", paths.spec.run_id, hub_path(paths.spec), error)
         return f"{type(error).__name__}: {error}"
     finally:

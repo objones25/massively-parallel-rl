@@ -163,6 +163,16 @@ def test_plan_within_budget_costs_at_the_given_price() -> None:
     assert est.total_usd == pytest.approx(17.0 * 2.2)
 
 
+def test_plan_within_budget_subtracts_the_long_run_minutes_already_trained() -> None:
+    """A reused pilot is the long run's first 45 min too: 18.5 h - 0.75 h = 17.75 h x $2.20 = $39.05 needs no cut."""
+    sweep, cuts, est = plan_within_budget(SweepSpec("main"), _m(), price_per_hour=2.2, long_run_done_minutes=45.0)
+
+    assert cuts == ()
+    assert sweep == SweepSpec("main")
+    assert est == estimate(SweepSpec("main"), _m(), 2.2, long_run_done_minutes=45.0)
+    assert est.total_usd == pytest.approx(17.75 * 2.2)
+
+
 def test_plan_within_budget_defaults_to_the_spec_price() -> None:
     _, cuts, est = plan_within_budget(SweepSpec("main"), _m())
 
