@@ -17,6 +17,7 @@ OPERATING_ERRORS = (
     errors.MeasurementsCorrupt,
     errors.PreflightFailed,
     errors.InvalidInput,
+    errors.CheckpointsCorrupt,
 )
 
 

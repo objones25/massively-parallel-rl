@@ -40,7 +40,9 @@ identically per env step, so the comparison stays fair.
 
 Off the clock: the one-time setup before the loop (random episode lengths, ``get_observations``,
 ``train_mode``, writer init), ``on_before_update`` (between the two measures), ``logger.log``,
-``on_iteration``, checkpoint I/O including ONNX export, ``on_checkpoint`` and writer shutdown.
+checkpoint I/O including ONNX export, ``on_checkpoint``, ``on_iteration`` and writer shutdown. Per
+iteration the order is ``logger.log``, the checkpoint (if due) with ``on_checkpoint``, then
+``on_iteration``, so an exception from ``on_iteration`` (a SIGTERM) never costs that iteration's checkpoint.
 """
 
 from __future__ import annotations
@@ -171,7 +173,7 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
             self.current_learning_iteration = it
             iterations_run += 1
 
-            # --- off the clock: logging, hooks, checkpoint I/O ---
+            # --- off the clock: logging, checkpoint I/O, hooks ---
             self.logger.log(
                 it=it,
                 start_it=start_it,
@@ -187,9 +189,6 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
                     else None
                 ),
             )
-            if on_iteration is not None:
-                on_iteration(it)
-
             budget_exhausted = clock.elapsed_s >= budget_s
             is_last = budget_exhausted or it == total_it - 1
             if is_last or next_checkpoint_due(clock.elapsed_s, checkpoint_every_s, last_saved_s):
@@ -197,6 +196,10 @@ class TimedOnPolicyRunner(VelocityOnPolicyRunner):
                 last_saved_s = clock.elapsed_s
                 if on_checkpoint is not None:
                     on_checkpoint(final)
+            # After the checkpoint block: a hook that raises (mprl.train raises a pending SIGTERM here) cannot
+            # cost this iteration's checkpoint, including the forced final one.
+            if on_iteration is not None:
+                on_iteration(it)
             if budget_exhausted:
                 break
 

@@ -53,3 +53,7 @@ class InvalidInput(MprlOperatingError):
 
 class Terminated(MprlOperatingError):
     """The process received SIGTERM (``kill``, ``docker stop``, a RunPod stop) during a guarded command."""
+
+
+class CheckpointsCorrupt(MprlOperatingError):
+    """A run has checkpoints on disk, but none of them loads; a human decides whether to start over."""

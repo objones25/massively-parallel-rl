@@ -212,3 +212,90 @@ def test_checkpoint_bytes_are_fsynced_before_the_rename_and_the_directory_after(
     CheckpointStore(tmp_path).save_atomic(_write_ok, 1, 180.0)
 
     assert events == ["fsync-file", "replace", "fsync-dir"]
+
+
+def test_crossed_window_excludes_the_next_mark(tmp_path: Path):
+    """[mark, mark + interval): a store holding only the 6:00 checkpoint has none for 3:00."""
+    store = CheckpointStore(tmp_path)
+    store.save_atomic(_write_ok, 2, 360.0)
+
+    assert store.crossed(3.0, 3.0) is None
+
+
+def test_write_failing_before_the_temp_file_exists_surfaces_its_own_error(tmp_path: Path):
+    def write(_path: Path) -> None:
+        raise ValueError("serialization failed")
+
+    with pytest.raises(ValueError, match=r"^serialization failed$"):
+        CheckpointStore(tmp_path).save_atomic(write, 1, 60.0)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_largest_representable_iteration_is_saved_and_listed(tmp_path: Path):
+    store = CheckpointStore(tmp_path)
+    ref = store.save_atomic(_write_ok, 9_999_999, 60.0)
+    assert store.list() == [ref]
+
+
+def test_iteration_past_seven_digits_is_rejected(tmp_path: Path):
+    with pytest.raises(CheckFailed, match=r"^iteration out of range: 10000000$"):
+        CheckpointStore(tmp_path).save_atomic(_write_ok, 10_000_000, 60.0)
+
+
+def test_save_creates_missing_parent_directories(tmp_path: Path):
+    store = CheckpointStore(tmp_path / "sweeps" / "main" / "checkpoints")
+
+    ref = store.save_atomic(_write_ok, 1, 60.0)
+
+    assert store.list() == [ref]
+
+
+def _torch_checkpoint(path: Path) -> None:
+    """A real torch.save zip archive, the format every checkpoint has (rsl_rl's payload, in miniature)."""
+    import torch
+
+    torch.save({"actor_state_dict": torch.nn.Linear(64, 64).state_dict(), "iter": 3, "infos": {}}, path)
+
+
+def test_intact_checkpoint_has_no_integrity_error(tmp_path: Path):
+    ref = CheckpointStore(tmp_path).save_atomic(_torch_checkpoint, 3, 180.0)
+
+    assert CheckpointStore.integrity_error(ref) is None
+
+
+@pytest.mark.parametrize("keep", [0.0, 0.01, 0.5, 0.999])
+def test_truncated_checkpoint_is_not_a_zip_archive(tmp_path: Path, keep: float):
+    ref = CheckpointStore(tmp_path).save_atomic(_torch_checkpoint, 3, 180.0)
+    raw = ref.path.read_bytes()
+    ref.path.write_bytes(raw[: int(len(raw) * keep)])
+
+    assert CheckpointStore.integrity_error(ref) == "BadZipFile: File is not a zip file"
+
+
+def test_flipped_bytes_in_a_checkpoint_fail_the_member_crc(tmp_path: Path):
+    """torch.load accepts this file (the flip lands in tensor data) and would resume from garbage weights."""
+    ref = CheckpointStore(tmp_path).save_atomic(_torch_checkpoint, 3, 180.0)
+    raw = bytearray(ref.path.read_bytes())
+    middle = len(raw) // 2
+    raw[middle : middle + 64] = b"\xff" * 64
+    ref.path.write_bytes(bytes(raw))
+
+    assert CheckpointStore.integrity_error(ref) == "CRC mismatch in member .model_it0000003_s000180.pt/data/0"
+
+
+def test_quarantine_renames_the_file_out_of_the_listing(tmp_path: Path):
+    store = CheckpointStore(tmp_path)
+    older = store.save_atomic(_write_ok, 1, 60.0)
+    newer = store.save_atomic(_write_ok, 2, 120.0)
+
+    moved = store.quarantine(newer)
+
+    assert moved == tmp_path / "model_it0000002_s000120.pt.corrupt"
+    assert moved.read_bytes() == b"weights"
+    assert store.list() == [older]
+    assert store.quarantined() == [moved]
+
+
+def test_quarantined_is_empty_for_a_missing_directory(tmp_path: Path):
+    assert CheckpointStore(tmp_path / "missing").quarantined() == []

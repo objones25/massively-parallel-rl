@@ -119,6 +119,26 @@ def test_raised_budget_continues(completed_run: CompletedRun) -> None:
     assert len(iterations) == len(set(iterations))
 
 
+def test_truncated_final_checkpoint_resumes_from_the_previous_real_one(completed_run: CompletedRun) -> None:
+    """A real checkpoint cut in half is quarantined; the real runner resumes from the older one and its clock."""
+    paths = RunPaths(completed_run.volume, run_spec(2.0))
+    store = CheckpointStore(paths.checkpoints_dir)
+    previous, final = store.list()
+    raw = final.path.read_bytes()
+    final.path.write_bytes(raw[: len(raw) // 2])
+
+    state = train_run(run_spec(4.0), completed_run.volume, DEPS)
+
+    assert state.status == "complete"
+    assert state.wandb_run_id == completed_run.state.wandb_run_id
+    assert state.uploads == {f"corrupt_checkpoint/{final.path.name}": "BadZipFile: File is not a zip file"}
+    assert (paths.checkpoints_dir / f"{final.path.name}.corrupt").is_file()
+    # Resumed at iteration 2 with the 1 s clock of iteration 1: checkpoints at the 2, 3 s marks and the 4 s budget.
+    assert previous.iteration == 1
+    assert [r.iteration for r in store.list()] == [1, 3, 5, 7]
+    assert state.train_seconds == pytest.approx(8 * ITERATION_S)
+
+
 def test_crash_after_final_checkpoint_completes_without_training(completed_run: CompletedRun) -> None:
     spec = run_spec(2.0)
     paths = RunPaths(completed_run.volume, spec)

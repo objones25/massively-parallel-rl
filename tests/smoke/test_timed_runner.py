@@ -26,6 +26,7 @@ from support import ITERATION_S, LONG_S, STEPS_PER_ITERATION, TICK_S, Ticker, ma
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import TASK_ID
+from mprl.errors import Terminated
 from mprl.negative_space import expect
 from mprl.timed_runner import LearnResult
 
@@ -209,7 +210,7 @@ def test_matches_rsl_rl_learn(build: Build, store: CheckpointStore) -> None:
 
 @dataclass(frozen=True)
 class HookedRun:
-    """One real 3-iteration ``learn_for`` whose two hooks record (name, iteration, clock) and busy-wait."""
+    """One real 3-iteration ``learn_for`` whose three hooks record (name, iteration, clock) and busy-wait."""
 
     result: LearnResult
     elapsed_s: float
@@ -247,6 +248,7 @@ def hooked_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[HookedRun]:
             max_iterations=HOOKED_ITERATIONS,
             on_before_update=hook("before_update"),
             on_iteration=hook("iteration"),
+            on_checkpoint=lambda ref: hook("checkpoint")(ref.iteration),
         )
         wall_s = time.perf_counter() - wall_start
         payload = torch.load(result.final.path, weights_only=False)
@@ -268,13 +270,43 @@ def test_checkpoint_payload_has_clock_and_step_counter(hooked_run: HookedRun) ->
 def test_hooks_run_in_order_off_the_clock(hooked_run: HookedRun) -> None:
     events = hooked_run.events
 
+    last = HOOKED_ITERATIONS - 1
+    # The final checkpoint is saved before on_iteration, so a SIGTERM raised there cannot lose it.
     assert [(name, it) for name, it, _ in events] == [
-        (name, it) for it in range(HOOKED_ITERATIONS) for name in ("before_update", "iteration")
-    ]
-    # Between consecutive hooks an update or a rollout ran, so the clock moved.
-    assert all(b[2] > a[2] for a, b in itertools.pairwise(events))
+        *((name, it) for it in range(last) for name in ("before_update", "iteration")),
+        ("before_update", last), ("checkpoint", last), ("iteration", last),
+    ]  # fmt: skip
+    # Between consecutive hooks an update or a rollout ran, so the clock moved; the checkpoint runs none.
+    rolled = [(a, b) for a, b in itertools.pairwise(events) if a[0] != "checkpoint"]
+    assert all(b[2] > a[2] for a, b in rolled)
+    assert events[-1][2] == events[-2][2]
     # On the clock it would hold the hooks' busy-waits too.
     assert hooked_run.elapsed_s <= hooked_run.wall_s - len(events) * HOOK_BUSY_S
+
+
+def _sigterm_once_past(clock: TrainingClock, budget_s: float) -> Callable[[int], None]:
+    """An ``on_iteration`` that raises ``Terminated`` (as train's does for a pending SIGTERM) once the budget is spent."""
+
+    def on_iteration(_it: int) -> None:
+        if clock.elapsed_s >= budget_s:
+            raise Terminated("received SIGTERM; stopping")
+
+    return on_iteration
+
+
+def test_sigterm_on_the_budget_iteration_still_saves_the_final_checkpoint(build: Build, store: CheckpointStore) -> None:
+    """train's on_iteration raises a pending SIGTERM as Terminated; the iteration's final save must come first."""
+    _, runner = build()
+    budget_s = 2 * ITERATION_S
+    clock = TrainingClock(now=Ticker(TICK_S))
+
+    with pytest.raises(Terminated, match=r"^received SIGTERM"):
+        runner.learn_for(
+            clock, budget_s, LONG_S, store, fresh_start=True, on_iteration=_sigterm_once_past(clock, budget_s)
+        )
+
+    assert [(ref.iteration, ref.train_seconds) for ref in store.list()] == [(1, float(round(budget_s)))]
+    assert runner.current_learning_iteration == 1
 
 
 def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, store: CheckpointStore) -> None:
@@ -301,6 +333,23 @@ def test_resume_in_fresh_runner_continues_iterations_and_clock(build: Build, sto
     assert result.final.iteration == resumed.current_learning_iteration
     assert clock.elapsed_s >= restored_s + 1.5
     assert torch.load(result.final.path, weights_only=False)["infos"]["clock"] == {"elapsed_s": clock.elapsed_s}
+
+
+def test_resume_in_fresh_runner_restores_the_adaptive_learning_rate(build: Build, store: CheckpointStore) -> None:
+    """The shipped schedule is adaptive (KL-driven); rsl-rl-lib 5.4.2's PPO.load sets ``learning_rate`` from the
+    loaded optimizer (ppo.py:391), so a resumed run continues at the rate it had reached, not the initial one."""
+    _, first = build(name="first")
+    initial = first.alg.learning_rate
+    first.learn_for(TrainingClock(), LONG_S, LONG_S, store, fresh_start=True, max_iterations=2)
+    at_save = first.alg.learning_rate
+    loaded = expect(store.latest(), "first run saved no checkpoint")
+    _, resumed = build(name="resumed")
+
+    resumed.load(str(loaded.path))
+
+    assert at_save != pytest.approx(initial)  # control: training moved the rate, so a reset would show
+    assert resumed.alg.learning_rate == pytest.approx(at_save)
+    assert resumed.alg.optimizer.param_groups[0]["lr"] == pytest.approx(at_save)
 
 
 def test_resume_in_fresh_runner_randomizes_episode_lengths(build: Build, store: CheckpointStore) -> None:
