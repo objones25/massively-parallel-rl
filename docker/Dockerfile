@@ -45,10 +45,14 @@ fi
 EOF
 
 # The environment lives outside /workspace (the network volume mount would hide baked files). uv uses the
-# base's Python 3.12 and never downloads another. The base sets UV_CACHE_DIR to the volume for pods; builds
-# use a cache mount instead. UV_NO_SYNC=1: `uv run` never syncs, because a plain sync would re-download the
-# 17 base packages into /opt/venv; docker/uv-sync-base.sh (here and in scripts/setup.sh) is the only sync.
+# base's Python 3.12 and never downloads another. The base sets UV_CACHE_DIR=/workspace/.cache/uv/, on the
+# network volume, whose quota a re-download of torch filled (2026-10-30); the runtime cache is moved to the
+# container disk, and builds still pass UV_CACHE_DIR=/tmp/uv-cache (a BuildKit cache mount) explicitly.
+# UV_NO_SYNC=1: `uv run` never syncs, because a plain sync would re-download the 17 base packages into
+# /opt/venv; docker/uv-sync-base.sh (here and in scripts/setup.sh) is the only sync, and it refuses any
+# environment that is not a venv with system site packages, so /opt/venv is created before its first call.
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_CACHE_DIR=/root/.cache/uv \
     UV_NO_SYNC=1 \
     UV_PYTHON=/usr/bin/python3.12 \
     UV_PYTHON_DOWNLOADS=never \
@@ -66,7 +70,7 @@ COPY docker/uv-sync-base.sh docker/base-provided-packages.txt docker/
 RUN --mount=type=cache,target=/tmp/uv-cache <<'EOF'
 set -euo pipefail
 uv --version
-uv venv --system-site-packages /opt/venv
+UV_CACHE_DIR=/tmp/uv-cache uv venv --system-site-packages /opt/venv
 UV_CACHE_DIR=/tmp/uv-cache docker/uv-sync-base.sh --no-install-project
 EOF
 

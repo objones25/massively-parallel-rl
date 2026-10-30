@@ -1,8 +1,11 @@
 """Setup checks: each check returns a detail line or raises.
 
 ``run_checks`` turns an operating error (``MprlOperatingError``: a missing key, a rejected credential, an
-unwritable volume) into ``ok=False`` with the error as the detail; anything else, a programmer error
-included, propagates. Each service check converts that service's documented failure exceptions into
+unwritable volume) into ``ok=False`` with the error as the detail. A broken install raises ``ImportError``,
+``AttributeError`` (PyOpenGL without libEGL: ``'NoneType' object has no attribute 'eglQueryString'``) or
+``OSError`` (a full volume) from deep inside a library; those also become a FAIL line, named by type and
+message, so the remaining checks still run. Anything else, a programmer error (``CheckFailed``) included,
+propagates. Each service check converts that service's documented failure exceptions into
 ``PreflightFailed``:
 
 - W&B (wandb 0.31.0): ``wandb.Api(api_key=..., timeout=...)`` verifies the key while it is built and
@@ -12,16 +15,24 @@ included, propagates. Each service check converts that service's documented fail
   ``WandbApiFailedError`` and ``ValueError``. All of these become ``PreflightFailed``.
 - Hugging Face (huggingface_hub 2.3.0): ``HfHubHTTPError`` (a bad token: 401, observed) and
   ``httpx2.TransportError``; ``HubPublisher.ensure_repo`` raises ``UploadFailed`` after its retries.
+  ``whoami()`` returns the token's role at ``auth.accessToken.role`` (the library itself reads it there in
+  ``_login.py``; the Hub docs name the roles read, write and fine-grained). A ``read`` token fails; a
+  fine-grained token's per-repo permissions are not exposed in a documented shape, so for it (and for a
+  reply with no role) the detail says write access is not verified.
 - RunPod: ``PodTerminator.status`` raises ``TerminateFailed`` for a non-200/404 reply or exhausted retries.
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import re
 import secrets
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from pathlib import Path
+from typing import Any, Final
 
 import httpx
 import httpx2
@@ -35,7 +46,7 @@ from wandb.sdk.lib.service.service_connection import WandbApiFailedError
 from mprl.config import TASK_ID
 from mprl.errors import MissingSecret, MprlOperatingError, PreflightFailed, TerminateFailed
 from mprl.hub import HubPublisher
-from mprl.negative_space import bounded, check_finite
+from mprl.negative_space import bounded, check_finite, expect, require
 from mprl.paths import volume_root
 from mprl.runpod import own_terminator
 from mprl.tasks import load_task_env_cfg
@@ -49,6 +60,14 @@ _ENV_CHECK_STEPS: Final = 4
 _GPU_DEVICE: Final = "cuda:0"
 _RUNPOD_TIMEOUT_S: Final = 30.0
 _WANDB_TIMEOUT_S: Final = 30
+_VOLUME_MOUNT: Final = Path("/workspace")  # where RunPod mounts the network volume
+IMAGE_VENV: Final = Path("/opt/venv")  # the image's environment (docker/Dockerfile)
+CONTAINER_UV_CACHE: Final = "/root/.cache/uv"
+PROC_MOUNTS: Final = Path("/proc/mounts")
+_MAX_MOUNTS: Final = 10_000
+_MOUNT_ESCAPE: Final = re.compile(r"\\([0-7]{3})")  # /proc/mounts escapes space, tab, newline and \ as \ooo
+_EGL_LIBRARY: Final = "libEGL.so.1"
+_ENVIRONMENT_ERRORS: Final = (ImportError, AttributeError, OSError)
 
 
 @dataclass(frozen=True)
@@ -63,12 +82,58 @@ def run_checks(checks: Sequence[Check]) -> list[CheckResult]:
     for name, check in bounded(checks, len(checks), "preflight checks"):
         try:
             detail = check()
-        except MprlOperatingError as error:
-            log.warning("preflight %s failed: %s", name, error)
+        except (MprlOperatingError, *_ENVIRONMENT_ERRORS) as error:
+            log.warning("preflight %s failed: %s: %s", name, type(error).__name__, error)
             results.append(CheckResult(name, ok=False, detail=f"{type(error).__name__}: {error}"))
             continue
         results.append(CheckResult(name, ok=True, detail=detail))
+    require(len(results) == len(checks), "a check produced no result")
     return results
+
+
+def _under(path: Path, parent: Path) -> bool:  # nsp: ignore NSP001 pure predicate
+    """``path`` is ``parent`` or below it, both with symlinks resolved (neither has to exist)."""
+    return path.resolve().is_relative_to(parent.resolve())
+
+
+def check_python_env(
+    env: Mapping[str, str], *, repo_dir: Path, torch_file: str, prefix: str, linux: bool, image_venv: Path
+) -> str:
+    """Python, torch and the uv cache live on the container disk, and ``uv run`` cannot sync the image venv.
+
+    A venv or cache on the volume re-downloads torch and the nvidia wheels onto the volume's quota (which
+    ``df`` does not show); that filled it on 2026-10-30, mid-install.
+    """
+    require(bool(torch_file), "torch has no __file__")
+    torch_path, prefix_path = Path(torch_file), Path(prefix)
+    problems: list[str] = []
+    places = (volume_root(env), _VOLUME_MOUNT, repo_dir / ".venv")
+    holding = [place for place in places if _under(torch_path, place)]
+    if holding:
+        problems.append(f"torch is imported from {torch_path.parent} (under {holding[0]}), not the base image's")
+    if _under(prefix_path, _VOLUME_MOUNT):
+        problems.append(f"the interpreter's prefix {prefix_path} is on the volume")
+    cache = env.get("UV_CACHE_DIR")
+    if cache and _under(Path(cache), _VOLUME_MOUNT):
+        problems.append(f"UV_CACHE_DIR={cache} is on the volume; export UV_CACHE_DIR={CONTAINER_UV_CACHE}")
+    if linux and image_venv.is_dir() and not env.get("UV_NO_SYNC"):
+        problems.append(f"UV_NO_SYNC is not set, so `uv run` would sync {image_venv}; export UV_NO_SYNC=1")
+    if problems:
+        raise PreflightFailed(
+            "; ".join(problems) + f". Re-run scripts/setup.sh, then `. /etc/profile.d/mprl-uv.sh` (venv {image_venv})"
+        )
+    return f"python {prefix_path}; torch {torch_path}"
+
+
+def check_egl(load: Callable[[str], Any] = ctypes.CDLL) -> str:
+    """libEGL.so.1 loads (mjlab sets MUJOCO_GL=egl; PyOpenGL needs it at ``import mjlab.tasks``)."""
+    try:
+        load(_EGL_LIBRARY)
+    except OSError as error:  # ctypes.CDLL raises OSError when the library cannot be found or loaded
+        raise PreflightFailed(
+            f"{_EGL_LIBRARY} cannot be loaded ({error}); run: apt-get update && apt-get install -y libegl1"
+        ) from error
+    return f"{_EGL_LIBRARY} loads"
 
 
 def _secret(env: Mapping[str, str], name: str) -> str:
@@ -126,11 +191,18 @@ def check_hf(env: Mapping[str, str]) -> str:
     repo_id = _secret(env, "HF_REPO_ID")
     api = HfApi(token=token)
     try:
-        user = api.whoami()["name"]
+        info = api.whoami()
+        user, role = info["name"], ((info.get("auth") or {}).get("accessToken") or {}).get("role")
+        if role == "read":
+            raise PreflightFailed(
+                f"HF_TOKEN is a read token for {user}; uploads need a write token: https://huggingface.co/settings/tokens"
+            )
         HubPublisher(api, repo_id, private=True).ensure_repo()
     except (HfHubHTTPError, httpx2.TransportError) as error:
         raise PreflightFailed(f"Hugging Face: {type(error).__name__}: {error}") from error
-    return f"token for {user}; repo {repo_id} exists"
+    if role == "write":
+        return f"write token for {user}; repo {repo_id} exists"
+    return f"token for {user} (role: {role or 'none reported'}; write access not verified); repo {repo_id} exists"
 
 
 def check_runpod(env: Mapping[str, str], client: httpx.Client | None = None) -> str:
@@ -154,9 +226,39 @@ def check_runpod(env: Mapping[str, str], client: httpx.Client | None = None) -> 
     )
 
 
-def check_volume(env: Mapping[str, str]) -> str:
-    """Write, read back and delete a temp file under MPRL_VOLUME_ROOT."""
+def _mount_points(mounts: Path) -> list[Path]:
+    """The mount points (second field) in a ``/proc/mounts``-format file, octal escapes decoded."""
+    lines = mounts.read_text(encoding="utf-8").splitlines()
+    points: list[Path] = []
+    for line in bounded(lines, _MAX_MOUNTS, f"{mounts} lines"):
+        fields = line.split()
+        if len(fields) >= 2:
+            points.append(Path(_MOUNT_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), fields[1])))
+    require(len(points) <= len(lines), "more mount points than lines")
+    return points
+
+
+def _volume_mount(root: Path, mounts: Path) -> Path:
+    """The mount holding ``root`` (the deepest mount point above it); ``PreflightFailed`` if that is ``/``."""
+    resolved = root.resolve()
+    holding = [point for point in _mount_points(mounts) if resolved.is_relative_to(point)]
+    mount = max(holding, key=lambda point: len(point.parts), default=Path("/"))
+    if mount == Path("/"):
+        raise PreflightFailed(
+            f"{root} is on the container disk (mount /), which is lost with the pod; set MPRL_VOLUME_ROOT under "
+            f"{_VOLUME_MOUNT} (the network volume)"
+        )
+    return mount
+
+
+def check_volume(env: Mapping[str, str], mounts: Path | None = None) -> str:
+    """MPRL_VOLUME_ROOT is on a mount other than ``/`` (when ``mounts`` exists), and is writable.
+
+    ``mounts`` is a ``/proc/mounts``-format file; ``None`` or a missing file (macOS) skips the mount rule.
+    The mount is checked first, so a root on the container disk is never created.
+    """
     root = volume_root(env)
+    mount = _volume_mount(root, mounts) if mounts is not None and mounts.is_file() else None
     probe = root / f".preflight-{secrets.token_hex(8)}"
     token = secrets.token_hex(16)
     try:
@@ -168,15 +270,31 @@ def check_volume(env: Mapping[str, str]) -> str:
         raise PreflightFailed(f"{root} is not writable: {type(error).__name__}: {error}") from error
     if read != token:
         raise PreflightFailed(f"{probe} read back different bytes than were written")
-    return f"{root} is writable"
+    return f"{root} is writable" if mount is None else f"{root} is writable (on mount {mount})"
 
 
-def default_checks(env: Mapping[str, str], require_gpu: bool) -> list[Check]:
-    """Every check in order; without ``require_gpu`` the CUDA and pod checks are skipped and the env runs on CPU."""
+def default_checks(env: Mapping[str, str], require_gpu: bool, *, repo_dir: Path) -> list[Check]:
+    """Every check in order. Without ``require_gpu`` (local testing) the pod-only checks are skipped (CUDA,
+    python-env, EGL, RunPod, and the volume's mount rule) and the env runs on CPU."""
     device = _GPU_DEVICE if require_gpu else "cpu"
+    torch_file = expect(torch.__file__, "torch was imported without a __file__")
     checks: list[Check] = []
     if require_gpu:
-        checks.append(("cuda", lambda: check_cuda(device)))
+        checks += [
+            ("cuda", lambda: check_cuda(device)),
+            (
+                "python-env",
+                lambda: check_python_env(
+                    env,
+                    repo_dir=repo_dir,
+                    torch_file=torch_file,
+                    prefix=sys.prefix,
+                    linux=sys.platform.startswith("linux"),
+                    image_venv=IMAGE_VENV,
+                ),
+            ),
+            ("egl", check_egl),
+        ]
     checks += [
         ("env", lambda: check_env(device)),
         ("wandb", lambda: check_wandb(env)),
@@ -184,5 +302,7 @@ def default_checks(env: Mapping[str, str], require_gpu: bool) -> list[Check]:
     ]
     if require_gpu:
         checks.append(("runpod", lambda: check_runpod(env)))
-    checks.append(("volume", lambda: check_volume(env)))
+    mounts = PROC_MOUNTS if require_gpu else None
+    checks.append(("volume", lambda: check_volume(env, mounts)))
+    require(len({name for name, _ in checks}) == len(checks), "duplicate check name")
     return checks

@@ -91,6 +91,24 @@ def write_env(path: Path, content: str, *, overwrite: bool) -> None:
         raise
 
 
+def effective_env(values: Mapping[str, str], environ: Mapping[str, str]) -> dict[str, str]:
+    """The environment a command sees once ``.env`` (``values``) is loaded: the shell's value wins.
+
+    ``mprl`` loads ``.env`` with python-dotenv's ``load_dotenv(override=False)``, which (python-dotenv 1.2.4,
+    ``DotEnv.set_as_environment_variables``) skips every key already in ``os.environ``, even an empty one.
+    """
+    env = {**values, **environ}
+    require(len(env) >= len(environ), "the merged environment lost a shell variable")
+    return env
+
+
+def shell_overrides(values: Mapping[str, str], environ: Mapping[str, str]) -> list[str]:
+    """Names of the ``.env`` keys whose shell value is set and differs, so the ``.env`` value is ignored."""
+    names = [name for name in values if name in environ and environ[name] != values[name]]
+    require(len(names) <= len(values), "more overrides than keys")
+    return names
+
+
 def prompt_values(
     vars: Sequence[EnvVar],
     existing: Mapping[str, str | None],

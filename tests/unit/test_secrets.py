@@ -73,6 +73,8 @@ def secrets_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.
     monkeypatch.setenv("HF_REPO_ID", "someone/mprl-test")
     monkeypatch.setenv("MPRL_VOLUME_ROOT", str(tmp_path / "volume"))
     monkeypatch.setenv("MPRL_ENV_FILE", str(tmp_path / "mprl.env"))
+    # The volume check's mount rule would fail tmp_path on Linux CI (it is on "/"); it reads no secret.
+    monkeypatch.setattr(preflight_mod, "PROC_MOUNTS", tmp_path / "no-proc-mounts")
     caplog.set_level(logging.DEBUG)
     return tmp_path
 
@@ -101,6 +103,7 @@ def test_setup_never_echoes_the_secrets_it_writes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     answers = {"HF_REPO_ID": "someone/mprl-test", "MPRL_VOLUME_ROOT": str(secrets_env / "volume")}
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: answers.get(prompt.split(" ")[0], ""))
     monkeypatch.setattr(getpass, "getpass", lambda prompt: SENTINELS[prompt.split(" ")[0]])
     # The env check builds the mjlab env (pinned in the smoke tier); it reads no secret.

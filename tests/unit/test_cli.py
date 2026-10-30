@@ -392,6 +392,87 @@ def test_env_file_override_is_loaded(
     assert f"{tmp_path / 'from-env-file'} is writable" in out
 
 
+# --- setup: needs a terminal; its preflight sees the keys as training will (the shell wins over .env) -----
+
+
+@pytest.fixture
+def setup_answers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """An interactive ``setup`` whose prompts are answered from the returned dict (Enter for the rest)."""
+    answers = {"HF_REPO_ID": "typed/repo", "HF_TOKEN": "hf_typed", "MPRL_VOLUME_ROOT": str(tmp_path / "volume")}
+    monkeypatch.setenv("MPRL_ENV_FILE", str(tmp_path / "mprl.env"))
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: answers.get(prompt.split(" ")[0], ""))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: answers.get(prompt.split(" ")[0], ""))
+    return answers
+
+
+@pytest.fixture
+def preflight_double(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    double = create_autospec(cli._preflight, return_value=0)
+    monkeypatch.setattr(cli, "_preflight", double)
+    return double
+
+
+def test_setup_refuses_without_a_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = tmp_path / "mprl.env"
+    monkeypatch.setenv("MPRL_ENV_FILE", str(env_file))
+    monkeypatch.setattr(cli, "_interactive", lambda: False)
+
+    code = cli.main(["setup", "--cpu"])
+
+    assert code == 1
+    assert "InvalidInput: setup asks for API keys and needs a terminal on stdin" in capsys.readouterr().err
+    assert not env_file.exists()
+
+
+def test_setup_preflight_uses_the_shell_value_over_the_typed_one(
+    setup_answers: dict[str, str], preflight_double: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HF_REPO_ID", "shell/repo")
+
+    code = cli.main(["setup", "--cpu"])
+
+    assert code == 0
+    env = preflight_double.call_args.args[0]
+    assert (env["HF_REPO_ID"], env["HF_TOKEN"]) == ("shell/repo", "hf_typed")
+
+
+def test_setup_warns_by_name_about_a_shell_value_that_differs_from_env_file(
+    setup_answers: dict[str, str],
+    preflight_double: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf_from_shell")
+
+    cli.main(["setup", "--cpu"])
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "HF_TOKEN is set in the shell and differs from" in warnings[0]
+    assert ("hf_from_shell" in caplog.text, "hf_typed" in caplog.text) == (False, False)
+
+
+def test_setup_preflight_uses_the_typed_value_over_the_old_env_file(
+    setup_answers: dict[str, str],
+    preflight_double: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tmp_path / "mprl.env").write_text("HF_REPO_ID=old/repo\n")
+    # Were the old .env loaded into os.environ, monkeypatch's registration makes teardown remove it.
+    monkeypatch.setenv("HF_REPO_ID", "unset-below")
+    monkeypatch.delenv("HF_REPO_ID")
+
+    cli.main(["setup", "--cpu"])
+
+    assert preflight_double.call_args.args[0]["HF_REPO_ID"] == "typed/repo"
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == []
+
+
 # --- SIGTERM (kill, docker stop, RunPod stop) is a failure exit of every guarded command ---------------
 
 
