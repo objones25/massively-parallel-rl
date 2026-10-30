@@ -271,21 +271,43 @@ def test_run_pilot_trains_the_pilot_spec_then_terminates(
     terminator.terminate.assert_called_once_with()
 
 
-@pytest.mark.parametrize(("label", "head", "reuse"), [("no flag", SHA, False), ("other HEAD", "d" * 40, True)])
-def test_stale_pilot_reuse_is_removed_when_not_accepted(
-    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch, label: str, head: str, reuse: bool
-) -> None:
+def test_stale_pilot_reuse_is_removed_without_the_flag(tmp_path: Path, train_run: MagicMock) -> None:
     _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
     run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
     reuse_file = sweep_results_dir(tmp_path, "main") / "pilot_reuse.json"
     assert reuse_file.is_file()
-    monkeypatch.setattr(sweep_mod, "git_sha", lambda: head)
     train_run.reset_mock()
 
-    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=reuse)
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=False)
 
-    assert _reused_id() in _trained(train_run), label
-    assert not reuse_file.exists(), label
+    assert _reused_id() in _trained(train_run)
+    assert not reuse_file.exists()
+
+
+def test_recorded_pilot_reuse_survives_a_code_change_after_the_sweep_started(
+    tmp_path: Path, train_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-29: the long run failed after the sweep; its fix changes HEAD, and the rerun must not retrain
+    the reused run (as with every other complete run, finished work is not redone on new code). The long run's
+    resume also restamps the pilot's state with the new sha."""
+    _write_pilot(tmp_path, _state(pilot_spec(SMALL)))
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+    reuse_file = sweep_results_dir(tmp_path, "main") / "pilot_reuse.json"
+    recorded = reuse_file.read_text()
+    head = "d" * 40
+    monkeypatch.setattr(sweep_mod, "git_sha", lambda: head)
+    _write_pilot(
+        tmp_path,
+        _state(replace(pilot_spec(SMALL), budget_minutes=90.0), status="failed", train_seconds=2700.0, sha=head),
+    )
+    train_run.reset_mock()
+
+    run_sweep(SMALL, tmp_path, DEPS, _m(), confirm=_yes, terminator=None, reuse_pilot=True)
+
+    assert _trained(train_run) == [r.run_id for r in SMALL.runs() if r.run_id != _reused_id()] + [
+        SMALL.long_run().run_id
+    ]
+    assert reuse_file.read_text() == recorded
 
 
 def test_sweep_refuses_unmeasured_counts(tmp_path: Path, train_run: MagicMock, terminator: MagicMock) -> None:

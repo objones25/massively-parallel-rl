@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -187,3 +189,26 @@ def test_crossed_is_the_earliest_in_its_window(seconds: set[int], mark: int):
         ref = store.crossed(float(mark), 3.0)
         expected = min((s for s in seconds if mark * 60 <= s < (mark + 3) * 60), default=None)
         assert getattr(ref, "train_seconds", None) == expected
+
+
+def test_checkpoint_bytes_are_fsynced_before_the_rename_and_the_directory_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A host or volume failure after os.replace must not leave a truncated file under a final name."""
+    events: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd: int) -> None:
+        events.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync-file")
+        real_fsync(fd)
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        events.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+
+    CheckpointStore(tmp_path).save_atomic(_write_ok, 1, 180.0)
+
+    assert events == ["fsync-file", "replace", "fsync-dir"]

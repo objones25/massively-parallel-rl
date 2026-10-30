@@ -46,26 +46,21 @@ def test_logger_builds_writer_and_logs_offline(tmp_path: Path, monkeypatch: pyte
     assert len(run_dirs) == 1
 
 
-def test_resume_from_iteration_uses_resume_from(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """With an iteration given, the writer asks wandb to rewind to that step (beta resume_from)."""
-    captured: dict[str, object] = {}
-    real_init = wandb.init
+def test_resumed_writer_continues_the_same_offline_run(tmp_path: Path) -> None:
+    """Real wandb: a resumed writer reopens the run by id (no rewind) and logs past the checkpoint iteration."""
+    first = ResumableWandbWriter(str(tmp_path / "logs"), "mprl-tests", RUN_ID, "g", mode="offline")
+    first.add_scalar("Loss/x", 1.0, 7)
+    first.stop()
 
-    def spy(*args: object, **kwargs: object) -> object:
-        captured.update(kwargs)
-        # offline mode cannot rewind a server-side run, so start the underlying run without resume_from
-        kwargs.pop("resume_from")
-        kwargs["id"] = RUN_ID
-        return real_init(*args, **kwargs)
-
-    monkeypatch.setattr(wandb, "init", spy)
-    writer = ResumableWandbWriter(
+    second = ResumableWandbWriter(
         str(tmp_path / "logs"), "mprl-tests", RUN_ID, "g", mode="offline", resume_from_iteration=7
     )
-    writer.stop()
-    assert captured["resume_from"] == f"{RUN_ID}?_step=7"
-    assert "id" not in captured
-    assert "resume" not in captured
+    second.add_scalar("Loss/x", 2.0, 8)
+    run_id = wandb.run.id if wandb.run is not None else None
+    second.stop()
+
+    assert run_id == RUN_ID
+    assert second.offline_fallback is None
 
 
 def test_store_config_accepts_real_mjlab_env_cfg(
