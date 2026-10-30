@@ -7,8 +7,10 @@ and upload-retry paths, the W&B id choice, state.json, the upload staging and th
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ from typing import Any
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
+import torch
 import wandb
 from huggingface_hub import HfApi
 from support import runpod_terminator
@@ -26,7 +29,7 @@ import mprl.train as train_mod
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock
 from mprl.config import RunSpec
-from mprl.errors import ConfigMismatch, Terminated
+from mprl.errors import CheckpointsCorrupt, ConfigMismatch, Terminated
 from mprl.hub import HubPublisher
 from mprl.negative_space import expect
 from mprl.paths import RunPaths
@@ -53,10 +56,35 @@ def _state(status: Status, *, wandb_run_id: str = "main-n00004-s0-w0", uploads: 
     )
 
 
+def _torch_checkpoint(path: Path) -> None:
+    """A real ``torch.save`` zip archive: the format train_run checks before it resumes from a checkpoint."""
+    torch.save({"actor_state_dict": torch.nn.Linear(8, 8).state_dict(), "iter": 0, "infos": {}}, path)
+
+
+def _saved(root: Path, iteration: int, seconds: float) -> CheckpointRef:
+    return CheckpointStore(RunPaths(root, SPEC).checkpoints_dir).save_atomic(_torch_checkpoint, iteration, seconds)
+
+
+def _truncate(*refs: CheckpointRef) -> None:
+    """Cut real checkpoints in half, as a volume fault after the rename would leave them."""
+    for ref in refs:
+        raw = ref.path.read_bytes()
+        ref.path.write_bytes(raw[: len(raw) // 2])
+
+
+def _corrupt_name(ref: CheckpointRef) -> Path:
+    return ref.path.with_name(ref.path.name + ".corrupt")
+
+
+def _logged_resume_from() -> object:
+    """``resume_from_iteration`` that train_run passed to the (doubled) ``wandb_logger_cfg``."""
+    return train_mod.wandb_logger_cfg.call_args.args[2]  # pyright: ignore[reportFunctionMemberAccess]  the double
+
+
 def _finished_run(root: Path) -> CheckpointRef:
     """A run directory as training leaves it: one final checkpoint, its ONNX and the params."""
     paths = RunPaths(root, SPEC)
-    final = CheckpointStore(paths.checkpoints_dir).save_atomic(lambda p: p.write_bytes(b"weights"), 3, 2.0)
+    final = CheckpointStore(paths.checkpoints_dir).save_atomic(_torch_checkpoint, 3, 2.0)
     (paths.checkpoints_dir / "checkpoints.onnx").write_bytes(b"onnx")
     (paths.run_dir / "params").mkdir(parents=True)
     for name in ("env.yaml", "agent.yaml"):
@@ -528,3 +556,175 @@ def test_wandb_offline_fallback_lands_in_state_json(tmp_path: Path, train: Magic
 
 def test_wandb_tags_name_the_env_count_and_seed() -> None:
     assert train_mod.wandb_tags(RunSpec("main", 64, 2, 45.0)) == ["n00064", "seed2"]
+
+
+# --- resume: which checkpoint, which W&B start, what state.json carries ------------------------------
+
+
+def _run_dir(root: Path, *, stored: bool, checkpoint: bool) -> CheckpointRef | None:
+    """A run directory with or without a running state.json and an iteration-3 checkpoint; the checkpoint."""
+    if stored:
+        save_state(RunPaths(root, SPEC).state_file, _state("running"))
+    return _saved(root, 3, 2.0) if checkpoint else None
+
+
+@pytest.mark.parametrize(
+    ("stored", "checkpoint", "expected"),
+    [
+        (True, True, 3),  # resume: the logger starts after the checkpoint's iteration
+        (True, False, None),  # crashed before the first checkpoint: trains from 0
+        (False, False, None),  # fresh run
+        (False, True, 3),  # state.json lost: the checkpoint still decides where training resumes
+    ],
+)
+def test_logger_resumes_from_the_checkpoint_iteration_training_resumes_from(
+    tmp_path: Path, train: MagicMock, stored: bool, checkpoint: bool, expected: int | None
+) -> None:
+    latest = _run_dir(tmp_path, stored=stored, checkpoint=checkpoint)
+    train.side_effect = _trains(tmp_path)
+
+    train_run(SPEC, tmp_path, DEPS)
+
+    assert train.call_args.args[4] == latest
+    assert _logged_resume_from() == expected
+
+
+def test_resumed_run_that_fails_keeps_its_stored_training_clock(tmp_path: Path, train: MagicMock) -> None:
+    paths = RunPaths(tmp_path, SPEC)
+    stored = RunState(SPEC.run_id, SPEC.config_hash(), "stored0", "running", 7.0, SPEC.budget_minutes, "sha", {})
+    save_state(paths.state_file, stored)
+    _saved(tmp_path, 3, 7.0)
+    train.side_effect = RuntimeError("env exploded")
+
+    with pytest.raises(RuntimeError, match=r"^env exploded$"):
+        train_run(SPEC, tmp_path, DEPS)
+
+    failed = expect(load_state(paths.state_file), "no state.json after the failure")
+    assert (failed.status, failed.train_seconds, failed.wandb_run_id) == ("failed", 7.0, "stored0")
+
+
+def test_checkpoint_without_state_resumes_under_a_new_wandb_id(
+    tmp_path: Path, train: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The W&B id is minted (not derivable from run_id), so the old W&B run cannot continue; the weights can."""
+    latest = _saved(tmp_path, 3, 2.0)
+    train.side_effect = RuntimeError("env exploded")
+
+    with caplog.at_level(logging.WARNING, logger="mprl.train"), pytest.raises(RuntimeError, match=r"^env exploded$"):
+        train_run(SPEC, tmp_path, DEPS)
+
+    failed = expect(load_state(RunPaths(tmp_path, SPEC).state_file), "no state.json after the failure")
+    assert train.call_args.args[4] == latest
+    assert failed.wandb_run_id.startswith(f"{SPEC.run_id}-")
+    assert train.call_args.args[3]["run_id"] == failed.wandb_run_id
+    assert failed.train_seconds == latest.train_seconds  # the checkpoint's clock, the best record left
+    assert [r.message for r in caplog.records if "no state.json" in r.message] == [
+        f"{SPEC.run_id}: checkpoint {latest.path.name} but no state.json; resuming it under a new W&B run "
+        f"{failed.wandb_run_id}"
+    ]
+
+
+SESSION_NOTES = {
+    "onnx": "RuntimeError: export failed",
+    "post_training": "CommError: 503",
+    "wandb": "offline fallback after CommError: 503",
+}
+
+
+def test_a_new_session_drops_the_previous_sessions_error_notes(tmp_path: Path, train: MagicMock) -> None:
+    """Notes about one session's post-training steps must not outlive a later clean session; Hub outcomes stay."""
+    paths = RunPaths(tmp_path, SPEC)
+    longer = RunSpec("main", 4, 0, 2 * SPEC.budget_minutes, EVERY_MIN)  # same run, raised budget
+    save_state(paths.state_file, _state("complete", uploads={**SESSION_NOTES, PATH_IN_REPO: "UploadFailed: 503"}))
+    _saved(tmp_path, 3, 2.0)
+    train.side_effect = _trains(tmp_path)
+
+    state = train_run(longer, tmp_path, DEPS)
+
+    assert state.status == "complete"
+    assert state.uploads == {PATH_IN_REPO: "UploadFailed: 503"}
+    assert expect(load_state(paths.state_file), "state").uploads == state.uploads
+
+
+def test_corrupt_latest_checkpoint_falls_back_to_the_previous_one(tmp_path: Path, train: MagicMock) -> None:
+    save_state(RunPaths(tmp_path, SPEC).state_file, _state("running"))
+    older = _saved(tmp_path, 1, 1.0)
+    newer = _saved(tmp_path, 2, 2.0)
+    _truncate(newer)
+    train.side_effect = _trains(tmp_path)
+
+    state = train_run(SPEC, tmp_path, DEPS)
+
+    assert train.call_args.args[4] == older
+    assert _logged_resume_from() == 1
+    assert state.wandb_run_id == "main-n00004-s0-w0"  # still the stored run: it resumes
+    assert not newer.path.exists()
+    assert _corrupt_name(newer).read_bytes() != b""
+    assert state.uploads == {"corrupt_checkpoint/model_it0000002_s000002.pt": "BadZipFile: File is not a zip file"}
+
+
+def test_quarantined_checkpoint_is_logged_as_a_warning(
+    tmp_path: Path, train: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    save_state(RunPaths(tmp_path, SPEC).state_file, _state("running"))
+    _saved(tmp_path, 1, 1.0)
+    newer = _saved(tmp_path, 2, 2.0)
+    _truncate(newer)
+    train.side_effect = _trains(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="mprl.train"):
+        train_run(SPEC, tmp_path, DEPS)
+
+    assert [r.message for r in caplog.records if r.levelno == logging.WARNING] == [
+        f"{SPEC.run_id}: checkpoint {newer.path.name} is corrupt (BadZipFile: File is not a zip file); "
+        f"moved to {_corrupt_name(newer).name}, trying the previous one"
+    ]
+
+
+def _unpicklable_archive(path: Path) -> None:
+    """An intact zip archive (every CRC passes) whose pickle is garbage: torch.load raises UnpicklingError."""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(f"{path.stem}/data.pkl", b"\x00garbage")
+        archive.writestr(f"{path.stem}/version", b"3\n")
+
+
+def test_checkpoint_that_fails_to_unpickle_is_quarantined(tmp_path: Path, train: MagicMock) -> None:
+    save_state(RunPaths(tmp_path, SPEC).state_file, _state("running"))
+    older = _saved(tmp_path, 1, 1.0)
+    newer = CheckpointStore(RunPaths(tmp_path, SPEC).checkpoints_dir).save_atomic(_unpicklable_archive, 2, 2.0)
+    train.side_effect = _trains(tmp_path)
+
+    state = train_run(SPEC, tmp_path, DEPS)
+
+    assert train.call_args.args[4] == older
+    assert _corrupt_name(newer).is_file()
+    assert state.uploads == {"corrupt_checkpoint/model_it0000002_s000002.pt": "UnpicklingError: invalid load key, '\\x00'."}
+
+
+def test_no_loadable_checkpoint_raises_for_a_human_to_decide(tmp_path: Path, train: MagicMock) -> None:
+    paths = RunPaths(tmp_path, SPEC)
+    save_state(paths.state_file, _state("running"))
+    refs = [_saved(tmp_path, 1, 1.0), _saved(tmp_path, 2, 2.0)]
+    _truncate(*refs)
+
+    with pytest.raises(CheckpointsCorrupt, match=r"^main-n00004-s0: no loadable checkpoint; quarantined "):
+        train_run(SPEC, tmp_path, DEPS)
+
+    train.assert_not_called()
+    stored = expect(load_state(paths.state_file), "state")
+    assert stored.status == "failed"
+    assert sorted(stored.uploads) == [f"corrupt_checkpoint/{ref.path.name}" for ref in refs]
+    assert [p.name for p in CheckpointStore(paths.checkpoints_dir).quarantined()] == [
+        _corrupt_name(ref).name for ref in refs
+    ]
+
+
+def test_quarantined_checkpoints_keep_refusing_a_silent_fresh_start(tmp_path: Path, train: MagicMock) -> None:
+    """After every checkpoint was moved aside the store looks empty; a retry must not train from scratch."""
+    paths = RunPaths(tmp_path, SPEC)
+    CheckpointStore(paths.checkpoints_dir).quarantine(_saved(tmp_path, 1, 1.0))
+
+    with pytest.raises(CheckpointsCorrupt, match=r"model_it0000001_s000001\.pt\.corrupt"):
+        train_run(SPEC, tmp_path, DEPS)
+
+    train.assert_not_called()

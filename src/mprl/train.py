@@ -5,16 +5,25 @@ Control flow of ``train_run`` (all paths under ``RunPaths(root, spec)``):
 1. A stored ``state.json`` whose ``config_hash`` differs from the spec's raises ``ConfigMismatch``.
 2. A ``complete`` state whose stored budget covers ``spec.budget_minutes`` is returned without building an
    env; if a publisher is given and the run's Hub upload is not "ok", only the upload is retried.
-3. With a checkpoint on disk the run resumes: the stored W&B id is reused with
-   ``resume_from_iteration = checkpoint iteration``, the latest checkpoint is loaded into a fresh runner
-   and the clock restored from it. With no checkpoint (fresh, or crashed before the first one) a new W&B
-   id is minted: reusing the crashed run's id would mix its history with steps that restart at 0.
-4. ``state.json`` is written ``running``, then ``learn_for`` runs to ``spec.budget_minutes * 60`` s of
+3. The newest checkpoint that loads is the one resumed from (``latest_loadable``): a newer one that is not
+   an intact archive, or does not unpickle, is renamed ``<name>.corrupt``, noted in ``state.uploads`` under
+   ``corrupt_checkpoint/<name>`` and logged, and the next-older one is tried. When checkpoints exist but none
+   loads (now or in an earlier session), ``CheckpointsCorrupt`` is raised: a human decides whether to start
+   over. Nothing is loaded into a runner before the check, so a failed candidate leaves no partial state.
+4. With a checkpoint the run resumes: the latest loadable checkpoint is loaded into a fresh runner, the
+   clock restored from it, and the writer gets ``resume_from_iteration = checkpoint iteration``. The stored
+   W&B id is reused when ``state.json`` exists; without it (lost, or written by nothing) a new id is minted,
+   since a minted id cannot be derived again, and a warning says so. With no checkpoint (fresh, or crashed
+   before the first one) a new W&B id is minted: reusing the crashed run's id would mix its history with
+   steps that restart at 0.
+5. ``state.json`` is written ``running``, then ``learn_for`` runs to ``spec.budget_minutes * 60`` s of
    *total* training clock (cumulative across resumes). An error during training writes ``failed`` and
    re-raises. A checkpoint already at or past the budget (killed after the final save) trains nothing.
-5. ``state.json`` is written ``complete``, then ``mprl.publish.upload_run`` uploads the final checkpoint, its
+6. ``state.json`` is written ``complete``, then ``mprl.publish.upload_run`` uploads the final checkpoint, its
    ONNX, the params and ``state.json``. Its outcome, and any error after the final checkpoint (writer stop,
-   ONNX export: ``post_training`` / ``onnx``), land in ``state.uploads``; none of them raises.
+   ONNX export: ``post_training`` / ``onnx``; W&B offline fallback: ``wandb``), land in ``state.uploads``;
+   none of them raises. Those three notes describe one session: a new session drops them before training,
+   while Hub outcomes (keyed by Hub path) and ``corrupt_checkpoint/*`` notes are kept.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import pickle
 import re
 import time
 import uuid
@@ -37,7 +47,7 @@ from mprl import diagnostics
 from mprl.checkpoints import CheckpointRef, CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import RunSpec, batch_arithmetic
-from mprl.errors import ConfigMismatch, Terminated
+from mprl.errors import CheckpointsCorrupt, ConfigMismatch, Terminated
 from mprl.negative_space import expect, require
 from mprl.paths import RunPaths
 from mprl.publish import export_onnx, hub_path, raise_if_sigterm_received, upload_run
@@ -58,6 +68,11 @@ DEFAULT_WANDB_PROJECT = "mprl-humanoid-walk"  # .env.example default (plan, Task
 _ONNX_KEY = "onnx"  # state.uploads keys for errors that are not uploads
 _POST_TRAINING_KEY = "post_training"
 _WANDB_KEY = "wandb"  # the run's W&B fell back to offline mode (``ResumableWandbWriter.offline_fallback``)
+_SESSION_KEYS: Final = frozenset({_ONNX_KEY, _POST_TRAINING_KEY, _WANDB_KEY})  # dropped when a session starts
+_CORRUPT_PREFIX = "corrupt_checkpoint/"  # + checkpoint file name: why it was quarantined
+# What torch 2.8.0's torch.load raises on a damaged file that is still a valid zip archive (a garbled pickle);
+# tests/unit/test_train_run.py builds one. Truncation is caught earlier, by the archive check.
+_UNPICKLE_ERRORS: Final = (RuntimeError, EOFError, pickle.UnpicklingError)
 
 
 @dataclass(frozen=True)
@@ -149,6 +164,44 @@ def wandb_run_id_for(
     suffix = mint()
     require(bool(suffix), "minted W&B id suffix is empty")
     return f"{run_id}-{suffix}"
+
+
+def checkpoint_defect(ref: CheckpointRef) -> str | None:
+    """Why ``ref`` cannot be resumed from (a damaged archive, a pickle that does not load), or None.
+
+    Loads to the CPU and touches no runner: ``MjlabOnPolicyRunner.load`` applies the actor, critic and
+    optimizer one after another, so a failure inside it could leave a runner half loaded.
+    """
+    archive_error = CheckpointStore.integrity_error(ref)
+    if archive_error is not None:
+        return archive_error
+    try:
+        torch.load(ref.path, map_location="cpu", weights_only=False)  # our own file, as runner.load reads it
+    except _UNPICKLE_ERRORS as error:
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
+def latest_loadable(store: CheckpointStore, run_id: str) -> tuple[CheckpointRef | None, dict[str, str]]:
+    """The newest checkpoint without a ``checkpoint_defect``, quarantining each newer one; plus the notes.
+
+    Notes map ``corrupt_checkpoint/<name>`` to the defect, for ``state.uploads``. Each checkpoint is tried at
+    most once, newest first.
+    """
+    refs = store.list()
+    notes: dict[str, str] = {}
+    for ref in reversed(refs):
+        defect = checkpoint_defect(ref)
+        if defect is None:
+            return ref, notes
+        moved = store.quarantine(ref)
+        log.warning(
+            "%s: checkpoint %s is corrupt (%s); moved to %s, trying the previous one",
+            run_id, ref.path.name, defect, moved.name,
+        )  # fmt: skip
+        notes[f"{_CORRUPT_PREFIX}{ref.path.name}"] = defect
+    require(len(notes) == len(refs), "a checkpoint was neither loaded nor quarantined")
+    return None, notes
 
 
 def failed_after_final_checkpoint(
@@ -297,25 +350,46 @@ def train_run(spec: RunSpec, root: Path, deps: TrainDeps) -> RunState:
             log.info("%s: complete at %.1f min budget; skipping", spec.run_id, state.budget_minutes)
         return state
 
-    latest = CheckpointStore(paths.checkpoints_dir).latest()
-    resuming = latest is not None and state is not None
+    store = CheckpointStore(paths.checkpoints_dir)
+    latest, corrupt = latest_loadable(store, spec.run_id)
+    if latest is None and store.quarantined():
+        if state is not None:
+            state.status = "failed"
+            state.uploads.update(corrupt)
+            save_state(paths.state_file, state)
+        raise CheckpointsCorrupt(
+            f"{spec.run_id}: no loadable checkpoint; quarantined {', '.join(p.name for p in store.quarantined())} "
+            f"in {paths.checkpoints_dir}. Restore a good checkpoint there, or remove the run directory to start over."
+        )
     wandb_run_id = wandb_run_id_for(state, latest, spec.run_id)
+    if latest is not None and state is None:
+        log.warning(
+            "%s: checkpoint %s but no state.json; resuming it under a new W&B run %s",
+            spec.run_id, latest.path.name, wandb_run_id,
+        )  # fmt: skip
+    if latest is None:
+        train_seconds = 0.0
+    elif state is None:
+        train_seconds = latest.train_seconds  # the checkpoint's clock: the only record left
+    else:
+        train_seconds = state.train_seconds
+    carried = {} if state is None else {k: v for k, v in state.uploads.items() if k not in _SESSION_KEYS}
     sha = git_sha()
     state = RunState(
         spec.run_id,
         spec.config_hash(),
         wandb_run_id,
         "running",
-        state.train_seconds if state is not None and latest is not None else 0.0,
+        train_seconds,
         spec.budget_minutes,
         sha,
-        dict(state.uploads) if state is not None else {},
+        {**carried, **corrupt},
     )
     save_state(paths.state_file, state)
     logger = wandb_logger_cfg(
         spec,
         wandb_run_id,
-        latest.iteration if resuming and latest else None,
+        None if latest is None else latest.iteration,  # where training resumes, with or without state.json
         deps.wandb_mode,
         git_sha=sha,
         environ=os.environ,
