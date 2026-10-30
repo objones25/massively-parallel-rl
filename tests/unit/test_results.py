@@ -350,3 +350,11 @@ def test_model_card_names_the_long_run_videos_and_the_small_n_overhead_bias():
     assert "main-long-n04096-s0" in card
     assert "2 evaluation marks" in card
     assert "weigh proportionally more on small-N runs" in card
+
+
+def test_long_run_videos_render_at_the_requested_height_and_width(tmp_path: Path, renderer: MagicMock):
+    _fill(CheckpointStore(RunPaths(tmp_path, LONG.long_run()).checkpoints_dir), [3.0])
+
+    _long_videos(tmp_path)  # size=(4, 6): (height, width)
+
+    assert [(c.kwargs["height"], c.kwargs["width"]) for c in renderer.call_args_list] == [(4, 6)]

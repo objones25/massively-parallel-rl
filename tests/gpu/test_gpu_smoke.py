@@ -8,6 +8,10 @@ every loss rsl_rl's logger reports is finite.
 ``MPRL_VOLUME_ROOT`` (default ``/workspace/mprl``: the network volume), then loads that file into a fresh runner and
 checks that the iteration, the training clock and the policy weights come back. It skips when the volume root's
 parent directory does not exist (no volume mounted).
+
+``test_results_path_on_cuda`` evaluates and renders a one-iteration checkpoint on ``cuda:0``: the ``results`` command's
+GPU path (EGL rendering through the host's NVIDIA driver, CUDA state copied to the renderer), which no training run
+exercises. Run it before ``results``, so a rendering failure costs seconds, not the evaluations before it.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from rsl_rl.utils.log_writer import LogWriter
@@ -27,7 +32,9 @@ from support import LONG_S
 from mprl.checkpoints import CheckpointStore
 from mprl.clock import TrainingClock, cuda_sync_for
 from mprl.config import RunSpec
+from mprl.evaluator import EvalConfig, evaluate_checkpoint
 from mprl.paths import volume_root
+from mprl.render import render_rollout
 from mprl.train import built_runner
 
 pytestmark = [
@@ -109,3 +116,20 @@ def test_checkpoint_round_trip_on_volume(volume_dir: Path) -> None:
     assert restored.elapsed_s == pytest.approx(clock.elapsed_s)
     assert sorted(loaded) == sorted(saved)
     assert [k for k in saved if not torch.equal(saved[k], loaded[k])] == []
+
+
+def test_results_path_on_cuda(tmp_path: Path) -> None:
+    with built_runner(_spec(SMALL_ENVS), DEVICE, "tensorboard", tmp_path / "logs") as trained:
+        clock = TrainingClock(sync=cuda_sync_for(DEVICE))
+        ref = trained.learn_for(
+            clock, LONG_S, LONG_S, CheckpointStore(tmp_path / "checkpoints"), fresh_start=True, max_iterations=1
+        ).final
+    cfg = EvalConfig(commands=((0.5, 0.0, 0.0),), envs_per_command=2, seeds=(0,), horizon_s=0.2)
+
+    result = evaluate_checkpoint("gputest", ref, cfg, DEVICE)
+    frames = render_rollout(ref, (0.5, 0.0, 0.0), 0.2, device=DEVICE)
+
+    assert 0.0 <= result.no_fall_fraction <= 1.0
+    assert frames.shape == (10, 360, 480, 3)  # round(0.2 s / 0.02 s)
+    assert frames.dtype == np.uint8
+    assert frames.max() > 0

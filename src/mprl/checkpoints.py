@@ -2,7 +2,9 @@
 
 A checkpoint becomes visible only through ``os.replace`` of a fully written temp file in the same
 directory, and ``list()`` parses only names matching the exact final pattern, so a partial file
-(pod killed mid-write) is never reported.
+(pod killed mid-write) is never reported. The temp file is fsynced before the rename and the directory
+after it, so a host or volume failure cannot leave a truncated file under a final name, which
+``latest()`` would pick and every resume would fail to load.
 """
 
 from __future__ import annotations
@@ -29,6 +31,14 @@ class CheckpointRef:
     path: Path
 
 
+def _fsync_path(path: Path, flags: int) -> None:
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class CheckpointStore:
     def __init__(self, directory: Path) -> None:
         self._dir = Path(directory)
@@ -47,10 +57,12 @@ class CheckpointStore:
         try:
             write(tmp)
             require(tmp.is_file(), f"write() did not create {tmp}")
+            _fsync_path(tmp, os.O_RDONLY)
             os.replace(tmp, final)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
+        _fsync_path(self._dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))  # the rename itself
         return CheckpointRef(iteration, float(seconds), final)
 
     def list(self) -> list[CheckpointRef]:

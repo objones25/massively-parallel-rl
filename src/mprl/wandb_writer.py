@@ -1,9 +1,12 @@
 """A resumable Weights & Biases writer for rsl_rl.
 
 rsl_rl's built-in ``WandbLogWriter`` calls ``wandb.init`` without ``id``/``resume``, so every pod restart
-would fork a new W&B run. ``ResumableWandbWriter`` pins the run id; on resume it passes
-``resume_from="<id>?_step=<iteration>"`` so history after the checkpoint is truncated and the steps of the
-resumed run (which starts at ``checkpoint_iteration + 1``) stay monotonic.
+would fork a new W&B run. ``ResumableWandbWriter`` pins the run id and always opens it with
+``id=<run_id>, resume="allow"``, fresh or resumed (a ``finished`` run reopens too). It does not use
+``resume_from`` (W&B Rewind): that is a private preview, and on 2026-10-29 the server answered it with a 400
+that killed the long run. Without rewind, W&B keeps the history logged before a crash; a resumed run logs
+from the checkpoint iteration on, and W&B ignores (with a warning) any step not above the run's last step, so
+after a crash the iterations between the last checkpoint and the crash keep their first values.
 
 Three more behaviors:
 
@@ -17,7 +20,10 @@ Three more behaviors:
   ``Train/*`` (mean reward, mean episode length), the equal-training-time comparison. Every other chart keeps
   the iteration step; any chart can switch its x-axis to ``Perf/train_clock_minutes`` in the UI.
 * **Offline fallback.** An online ``wandb.init`` that fails with an operating error (``CommError``, which
-  includes ``AuthenticationError``, or ``TimeoutError``) is retried once in offline mode with the same id, so
+  includes ``AuthenticationError``, the base ``wandb.errors.Error`` of an UNKNOWN wandb-core error, or
+  ``TimeoutError``) is retried once in offline mode with the same id, after
+  ``wandb.teardown()`` (the failed init leaves the id claimed in wandb's service, and a retry without the
+  teardown raises ``ServerResponseError: run ID ... is in use``; seen with wandb 0.31.0 on 2026-10-29), so
   one W&B outage does not abort an unattended sweep. The reason is kept in ``offline_fallback`` (``train``
   records it in ``state.json``) and logged as a warning; ``wandb sync`` uploads the offline run later. A
   ``UsageError`` (a bad argument: a bug) is not caught.
@@ -33,7 +39,8 @@ from typing import Any, Final
 
 import wandb
 from rsl_rl.utils.log_writer import LogWriter
-from wandb.errors import CommError
+from wandb.errors import Error as WandbError
+from wandb.errors import UsageError
 
 from mprl.negative_space import require
 
@@ -43,7 +50,9 @@ WRITER_CLASS_NAME = "mprl.wandb_writer:ResumableWandbWriter"  # "module:Attr" fo
 CLOCK_METRIC: Final = "Perf/train_clock_minutes"
 _CLOCK_AXIS_GLOBS: Final = ("Train/*",)
 _WALL_TIME_SUFFIX: Final = "/time"
-_INIT_OPERATING_ERRORS: Final = (CommError, TimeoutError)  # wandb 0.31: network, auth (a CommError), init timeout
+# wandb 0.31 maps wandb-core error codes to Error (UNKNOWN), CommError (incl. AuthenticationError) and UsageError
+# (wandb/errors/util.py); every one but UsageError is the outside world, as is the init timeout.
+_INIT_OPERATING_ERRORS: Final = (WandbError, TimeoutError)
 
 
 class ResumableWandbWriter(LogWriter):
@@ -73,16 +82,18 @@ class ResumableWandbWriter(LogWriter):
             "config": {"log_dir": log_dir, **(extra_config or {})},
         }
         self.offline_fallback: str | None = None
+        if resume_from_iteration is not None:
+            log.info("resuming W&B run %s from iteration %d", run_id, resume_from_iteration)
         try:
-            if resume_from_iteration is None:
-                run = wandb.init(id=run_id, resume="allow", mode=mode, **common)  # pyright: ignore[reportArgumentType]
-            else:
-                run = wandb.init(resume_from=f"{run_id}?_step={resume_from_iteration}", mode=mode, **common)  # pyright: ignore[reportArgumentType]
+            run = wandb.init(id=run_id, resume="allow", mode=mode, **common)  # pyright: ignore[reportArgumentType]
+        except UsageError:
+            raise  # a bad argument: a bug, not the outside world
         except _INIT_OPERATING_ERRORS as error:
             if mode != "online":
                 raise
             self.offline_fallback = f"{type(error).__name__}: {error}"
             log.warning("wandb.init failed for %s (%s); falling back to offline mode for this run", run_id, error)
+            wandb.teardown()  # frees the run id the failed online init still holds in wandb's service
             run = wandb.init(id=run_id, resume="allow", mode="offline", **common)  # pyright: ignore[reportArgumentType]
         self._run = run
         run.define_metric(CLOCK_METRIC)

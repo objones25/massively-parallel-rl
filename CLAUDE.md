@@ -230,7 +230,7 @@ PPO config. Spec: `docs/superpowers/specs/2026-10-27-parallel-humanoid-walking-d
 | `checkpoints.py` | `CheckpointStore`: atomic minute-stamped files, `latest`, `crossed(mark)` |
 | `timed_runner.py` | `TimedOnPolicyRunner.learn_for`: rsl_rl 5.4.2's `learn` on the clock, time-based checkpoints |
 | `diagnostics.py` | `Diag/*`: gradient, weight, update-ratio, activation, KL / clip fraction / explained variance |
-| `wandb_writer.py` | `ResumableWandbWriter` (rsl_rl `LogWriter`; fixed id, `resume_from` on resume; drops `*/time`; offline fallback) |
+| `wandb_writer.py` | `ResumableWandbWriter` (rsl_rl `LogWriter`; fixed id, `resume="allow"` fresh or resumed, never `resume_from`; drops `*/time`; offline fallback after `wandb.teardown()`) |
 | `train.py` | `train_run`: skip / resume / train / state / upload for one run; `built_runner`; `git_sha` |
 | `run_state.py` | `state.json` (atomic): status, W&B id, config hash, clock, git sha, upload outcomes |
 | `hub.py` | `HubPublisher`: Hugging Face repo + folder upload with bounded retry |
@@ -261,7 +261,8 @@ long-run videos (`render_long_run_videos`), and publishes to W&B and the Hub.
 `step=int(tot_time)` for any non-W&B writer, and W&B silently drops steps lower than the current one, which would
 discard every later per-iteration metric. `train._learn` logs `Perf/train_clock_minutes` (the training clock) every
 iteration, off the clock; it is `define_metric`-ed and the default x-axis of `Train/*`. An online `wandb.init`
-failing with `CommError` (incl. `AuthenticationError`) or `TimeoutError` retries offline with the same id and is
+failing with a `wandb.errors.Error` other than `UsageError` (incl. `CommError`, `AuthenticationError`) or `TimeoutError`
+tears down wandb's service and retries offline with the same id and is
 recorded in `state.json` `uploads["wandb"]`; `UsageError` is not caught.
 
 **Videos.** Training renders nothing. `mprl results` renders, per long-run (`<sweep>-long`) evaluation mark, the

@@ -18,15 +18,19 @@
    pilot is ``complete`` with at least 45 training minutes, or this same reuse was already recorded
    (the long run, resuming the pilot past 45 minutes, may have crashed). The reuse is written to
    ``sweep_results_dir/pilot_reuse.json`` (results read that run's checkpoints up to 45 minutes) and
-   the run is skipped. When no reuse is accepted, a ``pilot_reuse.json`` left by an earlier
-   invocation is removed, since that run now trains for real.
+   the run is skipped. A reuse already recorded on the sha the sweep started on stays accepted after
+   HEAD changes (a fix after the sweep, as on 2026-10-29), like every other complete run, which is
+   skipped whatever the sha: the pilot's first 45 minutes are finished work and are never retrained.
+   When no reuse is accepted, a ``pilot_reuse.json`` left by an earlier invocation is removed, since
+   that run now trains for real.
 4. Every remaining run trains through ``train_run`` (count-major), then the long run, which resumes
    the pilot, inside a ``PodGuard``; ``release_device_memory`` runs after each one (the finished
    runner/env is a gc-only cycle holding GPU memory): a crash still terminates the pod, then re-raises (a failed
    termination is attached to it as a note).
 
-Refusing the confirmation or exceeding the cap returns or raises *before* any training and leaves the
-pod running, since the user is at the prompt.
+Refusing the confirmation returns before any training and leaves the pod running. Exceeding the cap
+(``BudgetExceeded``) also raises before any training, but ``cli`` runs the sweep inside its pod guard, so
+that pod is terminated.
 """
 
 from __future__ import annotations
@@ -219,7 +223,7 @@ def _pilot_reuse(planned: SweepSpec, root: Path, sha: str, started_sha: str) -> 
     entry: dict[str, Any] = {
         "source_run_dir": str(paths.run_dir),
         "max_minutes": PILOT_MINUTES,
-        "git_sha": sha,
+        "git_sha": started_sha,
         "config_hash": expected_hash,
     }
     state = load_state(paths.state_file)
@@ -227,6 +231,8 @@ def _pilot_reuse(planned: SweepSpec, root: Path, sha: str, started_sha: str) -> 
     reason = ""
     if planned.budget_minutes > PILOT_MINUTES:
         reason = f"the sweep's {planned.budget_minutes:g} min budget is longer than the pilot's {PILOT_MINUTES:g} min"
+    elif recorded:
+        pass  # accepted on the sweep's own code; a later HEAD does not undo finished work (see module docstring)
     elif sha == _UNKNOWN_SHA:
         reason = "HEAD is unknown, so the code cannot be shown unchanged"
     elif started_sha != sha:

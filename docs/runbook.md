@@ -210,9 +210,12 @@ export RUNPOD_POD_ID=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^RUNPOD_POD_ID
 uv run --no-sync pytest -m network -v --no-cov --deselect tests/network/test_runpod_terminate.py
 ```
 
-`test_wandb_resume.py` is the only test of W&B `resume_from` against the real service (project `mprl-tests`);
-`test_hub_real.py` creates a private `<you>/mprl-smoke-test` repo. If the W&B resume test fails, report it before
-the sweep (section 9).
+`test_wandb_resume.py` tests resuming a finished W&B run by id and the offline fallback against the real service
+(project `mprl-tests`); `test_hub_real.py` creates a private `<you>/mprl-smoke-test` repo. **Never skip this tier
+before a paid session:** on 2026-10-29 it was skipped (no `WANDB_API_KEY` in the shell), and the long run then died
+at `wandb.init` because the server rejected `resume_from` (W&B Rewind is a private preview), which every
+autospecced unit test had accepted. If a network test fails, stop and fix it before training (section 9). From the
+Mac, `WANDB_API_KEY` can come from `~/.netrc` (machine `api.forge.coreweave.com`, written by `wandb login`).
 
 **Throughput test** (about 15 min):
 
@@ -446,8 +449,10 @@ in a warning and in its `state.json` (`uploads.wandb`), and the sweep goes on; u
 
   Until then, self-termination at the end of `pilot` is the first real test: check `runpodctl pod list` after
   the pilot and delete the pod by hand if it is still there.
-- **W&B `resume_from` is untested online** (it is a beta W&B feature). `test_wandb_resume.py` in session A tests it.
-  If it fails, resumed runs fail at `wandb.init`; the fallback is `--wandb-mode offline` on the resumed command.
+- **W&B resume** (fixed 2026-10-29): resumed runs reopen the run by id with `resume="allow"`; `resume_from` (Rewind)
+  is a private preview and was rejected with a 400. The offline fallback now calls `wandb.teardown()` first (without
+  it the retry raised "run ID ... is in use"). Both are tested live by `test_wandb_resume.py`. After a crash between
+  checkpoints, W&B keeps the pre-crash values for the iterations between the last checkpoint and the crash.
 - **mujoco_warp out-of-memory class on the A100.** The throughput test records only `torch.OutOfMemoryError` as
   "does not fit"; any other allocation error ends the command. The workaround is in section 4.
 - **EGL rendering on RunPod** is unverified; the render tests in session A check it (results need it, training

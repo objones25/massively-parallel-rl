@@ -14,7 +14,7 @@ from mprl.wandb_writer import CLOCK_METRIC, ResumableWandbWriter, logger_cfg
 
 @pytest.mark.parametrize(
     ("resume_from_iteration", "run_keys"),
-    [(None, {"id", "resume"}), (3, {"resume_from"})],
+    [(None, {"id", "resume"}), (3, {"id", "resume"})],
     ids=["fresh", "resumed"],
 )
 def test_wandb_init_accepts_the_keywords_we_pass(
@@ -30,6 +30,35 @@ def test_wandb_init_accepts_the_keywords_we_pass(
     common = {"project", "entity", "group", "job_type", "mode", "tags", "config"}
     assert passed == common | run_keys
     assert passed <= set(inspect.signature(wandb.init).parameters)
+
+
+@pytest.mark.parametrize("resume_from_iteration", [None, 2534], ids=["fresh", "resumed"])
+def test_init_continues_the_run_by_id_without_rewind(
+    resume_from_iteration: int | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``resume_from`` (W&B Rewind) is a private preview: the server answers 400, which killed the 2026-10-29 long run."""
+    init = create_autospec(wandb.init, return_value=_run_double())
+    monkeypatch.setattr(wandb, "init", init)
+
+    ResumableWandbWriter("logs", "p", "rid", "grp", resume_from_iteration=resume_from_iteration, mode="online")
+
+    kwargs = init.call_args.kwargs
+    assert (kwargs["id"], kwargs["resume"], "resume_from" in kwargs) == ("rid", "allow", False)
+
+
+def test_offline_retry_tears_down_the_failed_online_run_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed online init keeps its run id in wandb's service; an offline retry with that id raises 'in use'."""
+    manager = MagicMock()
+    init = create_autospec(wandb.init, side_effect=[CommError("entity not found"), _run_double()])
+    teardown = create_autospec(wandb.teardown)
+    manager.attach_mock(init, "init")
+    manager.attach_mock(teardown, "teardown")
+    monkeypatch.setattr(wandb, "init", init)
+    monkeypatch.setattr(wandb, "teardown", teardown)
+
+    ResumableWandbWriter("logs", "p", "rid", "grp", mode="online")
+
+    assert [name for name, _, _ in manager.mock_calls] == ["init", "teardown", "init"]
 
 
 def test_logger_cfg_shape() -> None:
@@ -100,20 +129,25 @@ def test_training_clock_is_defined_as_the_train_metrics_x_axis(run: MagicMock) -
 
 @pytest.mark.parametrize(
     "error",
-    [CommError("Network error (ConnectTimeout)"), AuthenticationError("API key invalid"), TimeoutError("init timed out")],
-    ids=["network", "auth", "timeout"],
+    [
+        CommError("Network error (ConnectTimeout)"),
+        AuthenticationError("API key invalid"),
+        TimeoutError("init timed out"),
+        wandb.errors.Error("wandb-core error tagged UNKNOWN"),
+    ],
+    ids=["network", "auth", "timeout", "unknown"],
 )
 def test_failed_online_init_falls_back_to_offline_for_that_run(
     error: Exception, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     init = create_autospec(wandb.init, side_effect=[error, _run_double()])
     monkeypatch.setattr(wandb, "init", init)
+    monkeypatch.setattr(wandb, "teardown", create_autospec(wandb.teardown))
 
     writer = ResumableWandbWriter("logs", "p", "rid", "grp", resume_from_iteration=7, mode="online")
 
     retry = init.call_args_list[1].kwargs
     assert (retry["mode"], retry["id"], retry["resume"]) == ("offline", "rid", "allow")
-    assert "resume_from" not in retry  # offline cannot rewind a server-side run
     assert writer.offline_fallback == f"{type(error).__name__}: {error}"
     assert "falling back to offline" in caplog.text
 
