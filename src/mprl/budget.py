@@ -167,16 +167,24 @@ _CUTS: Final[dict[str, Callable[[SweepSpec], SweepSpec]]] = {
 
 
 def plan_within_budget(
-    sweep: SweepSpec, m: Measurements, cap_usd: float = CAP_USD, *, price_per_hour: float = PRICE_PER_HOUR
+    sweep: SweepSpec,
+    m: Measurements,
+    cap_usd: float = CAP_USD,
+    *,
+    price_per_hour: float = PRICE_PER_HOUR,
+    long_run_done_minutes: float = 0.0,
 ) -> tuple[SweepSpec, tuple[str, ...], CostEstimate]:
     """Apply ``CUT_ORDER`` one cut at a time until the estimate at ``price_per_hour`` is within ``cap_usd``.
+
+    ``long_run_done_minutes`` goes to every ``estimate``: long-run minutes already counted elsewhere (a reused
+    pilot's 45, which are also one of the sweep's runs).
 
     A cut that would not change the sweep (16384 already absent, fewer than 3 seeds) is not applied
     or reported. Raises ``BudgetExceeded`` with the final estimate if every cut is not enough.
     """
     require(tuple(_CUTS) == CUT_ORDER, "cut table out of sync with CUT_ORDER")
     require(NEVER_DROPPED in sweep.env_counts, f"sweep {sweep.name} lacks the {NEVER_DROPPED}-env count")
-    est = estimate(sweep, m, price_per_hour)
+    est = estimate(sweep, m, price_per_hour, long_run_done_minutes=long_run_done_minutes)
     applied: list[str] = []
     for name in CUT_ORDER:
         if est.total_usd <= cap_usd:
@@ -186,7 +194,7 @@ def plan_within_budget(
             continue
         sweep = cut
         applied.append(name)
-        est = estimate(sweep, m, price_per_hour)
+        est = estimate(sweep, m, price_per_hour, long_run_done_minutes=long_run_done_minutes)
     require(NEVER_DROPPED in sweep.env_counts, f"a cut removed the {NEVER_DROPPED}-env count")
     if est.total_usd > cap_usd:
         raise BudgetExceeded(

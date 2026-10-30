@@ -58,6 +58,45 @@ def test_non_oom_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         measure_throughput((4,), 2, "cpu", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
 
 
+# warp 1.18.0 warp/_src/context.py, CudaDefaultAllocator.allocate / CudaMempoolAllocator.allocate: a failed
+# device allocation is a plain RuntimeError with exactly this text (mujoco_warp allocates its Data through warp).
+WARP_OOM = "Failed to allocate 8589934592 bytes on device 'cuda:0'"
+
+
+def test_warp_allocation_failure_is_recorded_as_not_fitting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def warp_oom(num_envs: int, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(WARP_OOM)
+
+    monkeypatch.setattr(
+        throughput_mod, "measure_count", create_autospec(throughput_mod.measure_count, side_effect=warp_oom)
+    )
+
+    m = measure_throughput((16384,), 2, "cuda:0", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
+
+    assert m.fits == {16384: False}
+    assert m.steps_per_second == {}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to allocate 64 bytes on device 'cuda:0':  Failed to allocate memory during graph capture because "
+        "memory pools are not enabled on device 'cuda:0'.  Try calling wp.set_mempool_enabled('cuda:0', True) "
+        "before capture begins.",  # a capture misconfiguration, not a full device
+        "Failed to allocate 64 bytes on device 'cpu'",  # host memory: not the GPU's fit
+        "warp kernel failed: Failed to allocate 64 bytes on device 'cuda:0'",
+    ],
+)
+def test_other_allocation_runtime_errors_propagate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, message: str) -> None:
+    def broken(num_envs: int, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(throughput_mod, "measure_count", create_autospec(throughput_mod.measure_count, side_effect=broken))
+
+    with pytest.raises(RuntimeError, match=r"^warp kernel failed|^Failed to allocate 64 bytes"):
+        measure_throughput((4,), 2, "cuda:0", work_dir=tmp_path, eval_seconds_per_checkpoint=0.0)
+
+
 class _Payload:
     """Stands in for the runner and rollout tensors a failing measurement holds."""
 

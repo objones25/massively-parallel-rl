@@ -137,3 +137,20 @@ def test_metrics_are_the_float_fields():
         "mean_time_to_fall_s",
         "mean_tracking_reward",
     )
+
+
+@pytest.mark.parametrize("order", [("a-s0", "a-s1", "a-s2"), ("a-s1", "a-s0", "a-s2"), ("a-s1", "a-s2", "a-s0")])
+def test_aggregate_band_ignores_nan_seeds_in_any_order(order: tuple[str, str, str]):
+    # min()/max() with a NaN depend on where the NaN sits; the band, mean and seed count must not.
+    values = {"a-s0": math.nan, "a-s1": 0.2, "a-s2": 0.6}
+    marked = {run_id: {3.0: _r(run_id, 3.0, values[run_id])} for run_id in order}
+
+    points = aggregate(marked, "vel_error_xy", dict.fromkeys(order, 64), [3.0])
+
+    assert points == [CurvePoint(64, 3.0, pytest.approx(0.4), 0.2, 0.6, 2)]
+
+
+def test_aggregate_mark_where_every_seed_is_nan_is_absent():
+    marked = {"a-s0": {3.0: _r("a-s0", 3.0, math.nan)}, "a-s1": {3.0: _r("a-s1", 3.0, math.nan)}}
+
+    assert aggregate(marked, "vel_error_xy", {"a-s0": 64, "a-s1": 64}, [3.0]) == []

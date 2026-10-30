@@ -10,7 +10,10 @@
    printed and the price recorded in the manifest. If any cut was applied,
    ``confirm(estimate, cuts)`` must return True, else nothing trains and ``[]`` is returned. The
    estimate counts the whole project (setup and the pilot's 45 minutes included), because the $40
-   cap is on total spend; it also still counts a reused pilot run, so it errs high.
+   cap is on total spend. A reused pilot (step 3, decided on the first plan) is one of the sweep's runs
+   *and* the long run's first 45 minutes, so the plan is then made again with those 45 long-run minutes
+   subtracted (``long_run_done_minutes``); the cuts and the estimate are the second plan's. Only
+   ``BudgetExceeded`` can come from the first, higher estimate.
 3. With ``reuse_pilot``, the pilot (``pilot_spec``: the long run's first 45 minutes) stands in for the
    sweep's ``n=long_run_envs, s=0`` run when the sweep's budget is at most 45 minutes and (a) HEAD is known and equals the pilot's ``git_sha`` and
    the sha the sweep was first started on, (b) the pilot's ``config_hash`` equals that sweep run's hash
@@ -142,17 +145,22 @@ def run_sweep(
     started_sha = prior.get("git_sha", sha)
     fitting, excluded = _exclude_unfit(sweep, m)
     planned, cuts, est = plan_within_budget(fitting, m, price_per_hour=price_per_hour)
-    print(f"sweep {sweep.name}: estimated cost (cuts: {', '.join(cuts) or 'none'})\n{est.describe()}")
-    if cuts and not confirm(est, cuts):
-        log.info("sweep %s: cuts %s not confirmed; nothing trained", sweep.name, cuts)
-        return []
-
     reused: dict[str, dict[str, Any]] = {}
     rejected = ""
     if reuse_pilot:
         reused, rejected = _pilot_reuse(planned, root, sha, started_sha)
         if rejected:
             print(f"sweep {sweep.name}: pilot not reused: {rejected}")
+    if reused:
+        # The reused pilot is also the long run's first 45 minutes: count them once. Fewer cuts keep the reused
+        # run (same name, budget and interval, so the same id and hash); the require below checks it.
+        planned, cuts, est = plan_within_budget(
+            fitting, m, price_per_hour=price_per_hour, long_run_done_minutes=PILOT_MINUTES
+        )
+    print(f"sweep {sweep.name}: estimated cost (cuts: {', '.join(cuts) or 'none'})\n{est.describe()}")
+    if cuts and not confirm(est, cuts):
+        log.info("sweep %s: cuts %s not confirmed; nothing trained", sweep.name, cuts)
+        return []
     write_json_atomic(
         results / _MANIFEST,
         {

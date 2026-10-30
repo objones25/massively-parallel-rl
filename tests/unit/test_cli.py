@@ -19,7 +19,7 @@ import mprl.cli as cli
 import mprl.runpod as runpod_mod
 from mprl.budget import PRICE_PER_HOUR, CostEstimate, Measurements, save_measurements
 from mprl.config import SweepSpec
-from mprl.errors import BudgetExceeded, OwnPodUnknown, Terminated, TerminateFailed
+from mprl.errors import BudgetExceeded, OwnPodUnknown, Terminated, TerminateFailed, UploadFailed
 from mprl.results import build_results
 from mprl.run_state import RunState
 from mprl.runpod import PodTerminator
@@ -337,6 +337,18 @@ def test_results_terminate_flag_terminates(root: Path, terminator: MagicMock, mo
     assert _main("results", "--name", "main", "--primary-metric", "vel_error_xy", "--terminate") == 0
 
     terminator.terminate.assert_called_once_with()
+
+
+def test_results_publish_failure_exits_nonzero_and_still_terminates(
+    root: Path, terminator: MagicMock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    failure = UploadFailed("sweep main results not published: hub: UploadFailed: 503")
+    monkeypatch.setattr(cli, "build_results", create_autospec(build_results, side_effect=failure))
+
+    assert _main("results", "--name", "main", "--primary-metric", "vel_error_xy", "--terminate") == 1
+
+    terminator.terminate.assert_called_once_with()
+    assert "mprl: UploadFailed: sweep main results not published: hub" in capsys.readouterr().err
 
 
 def test_cli_metric_choices_match_the_curves_metrics() -> None:

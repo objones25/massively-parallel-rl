@@ -55,12 +55,22 @@ def _cuts_section(manifest: Mapping[str, Any]) -> list[str]:
 
 
 def _long_run_lines(
-    sweep: SweepSpec, marks: Sequence[float], command: tuple[float, float, float], seconds: float
+    sweep: SweepSpec, marks: Sequence[float], command: tuple[float, float, float], seconds: float, problem: str
 ) -> list[str]:
     run_id = sweep.long_run().run_id
+    note = (
+        [f"The long run did not complete ({problem}): its videos stop at the last checkpoint it saved.", ""]
+        if problem
+        else []
+    )
     if not marks:
-        return [f"`long_run_videos/`: none; the long run `{run_id}` has no checkpoint at any evaluation mark.", ""]
+        return [
+            *note,
+            f"`long_run_videos/`: none; the long run `{run_id}` has no checkpoint at any evaluation mark.",
+            "",
+        ]
     return [
+        *note,
         f"`long_run_videos/`: the long run `{run_id}` ({sweep.long_run_envs} envs, {sweep.long_run_minutes:g} "
         f"training minutes) at {len(marks)} evaluation marks ({marks[0]:g} to {marks[-1]:g} min), each the "
         f"checkpoint that crossed the mark rendered for {seconds:g} s in real time on command {command}; "
@@ -79,7 +89,9 @@ def model_card(
     final_points: Sequence[CurvePoint],
     race: tuple[tuple[float, float, float], float, float, Mapping[int, str]],
     long_run_video_marks: Sequence[float] = (),
+    long_run_problem: str = "",
 ) -> str:
+    """The card. ``long_run_problem`` is why the long run is not ``complete`` ("" when it is)."""
     command, race_seconds, median_at, median = race
     batch_rows = []
     for n in sweep.env_counts:
@@ -155,6 +167,6 @@ def model_card(
         "",
         "`results.csv`: one row per run and evaluation mark (absent marks have no row).",
         "",
-        *_long_run_lines(sweep, long_run_video_marks, command, race_seconds),
+        *_long_run_lines(sweep, long_run_video_marks, command, race_seconds, long_run_problem),
     ]
     return "\n".join(lines)

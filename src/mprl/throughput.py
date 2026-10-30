@@ -15,7 +15,10 @@ Logging goes to TensorBoard here, not W&B, so W&B's own overhead is not included
 
 A count whose run raises the CUDA ``torch.OutOfMemoryError`` (verified in torch 2.14.1:
 ``torch.cuda.OutOfMemoryError is torch.OutOfMemoryError``, a ``RuntimeError`` subclass) is recorded
-as ``fits[n] = False`` and the test continues; every other error propagates.
+as ``fits[n] = False`` and the test continues, and so is Warp's failed device allocation (mujoco_warp
+allocates the simulation state through Warp): warp 1.18.0 raises a plain ``RuntimeError("Failed to allocate
+<bytes> bytes on device 'cuda:<i>'")``, matched by its whole text (``is_device_oom``). Every other error
+propagates.
 
 ``measure_throughput`` takes ``eval_seconds_per_checkpoint`` from the caller; ``measure_eval_seconds``
 measures it as the wall time of one ``evaluate_checkpoint`` on a count's throughput checkpoint (env
@@ -26,6 +29,7 @@ are included too, so it errs high).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
@@ -49,6 +53,10 @@ log = logging.getLogger(__name__)
 
 _SWEEP: Final = "throughput"
 _NEVER_S: Final = 1e9  # budget and checkpoint period that max_iterations always beats
+# warp 1.18.0 (warp/_src/context.py, CudaDefaultAllocator / CudaMempoolAllocator.allocate): a failed device
+# allocation raises a plain RuntimeError with exactly this text. The graph-capture variant (a suffix naming
+# memory pools) is a misconfiguration, not a full device, and does not match.
+_WARP_DEVICE_OOM: Final = re.compile(r"Failed to allocate \d+ bytes on device 'cuda:\d+'")
 _DIAGNOSTICS_EVERY_K: Final = TrainDeps(None, "disabled", "cpu").diagnostics_every_k  # as train_run
 
 
@@ -116,6 +124,13 @@ def measure_count(
     return CountMeasurement(sps, per_iteration + save)
 
 
+def is_device_oom(error: RuntimeError) -> bool:
+    """Whether ``error`` says the GPU ran out of memory: torch's CUDA OOM, or Warp's failed device allocation."""
+    if isinstance(error, torch.OutOfMemoryError):
+        return True
+    return _WARP_DEVICE_OOM.fullmatch(str(error)) is not None
+
+
 def count_dir(work_dir: Path, num_envs: int) -> Path:
     """Scratch dir of one count's measurement; its final checkpoint is under ``checkpoints/``."""
     return work_dir / f"n{num_envs:05d}"
@@ -151,7 +166,9 @@ def measure_throughput(
         measured: CountMeasurement | None = None
         try:
             measured = measure_count(n, iterations, device, count_dir(work_dir, n), checkpoint_every_minutes)
-        except torch.OutOfMemoryError as error:
+        except RuntimeError as error:  # torch.OutOfMemoryError is one; any other is re-raised
+            if not is_device_oom(error):
+                raise
             # Log the text, not the exception: a handler that keeps LogRecords would keep its traceback.
             log.warning("num_envs=%d does not fit on %s: %s", n, device, str(error))
         # Released only here: inside the except, error.__traceback__ still pins the failed run's frames
